@@ -1,0 +1,8 @@
+[submodule "third_party/NeoML"]
+	path = third_party/NeoML
+	url = https://github.com/neoml-lib/NeoML
+	branch = master
+[submodule "third_party/oneDNN"]
+	path = third_party/oneDNN
+	url = https://github.com/oneapi-src/oneDNN
+	branch = rls-v1.6
