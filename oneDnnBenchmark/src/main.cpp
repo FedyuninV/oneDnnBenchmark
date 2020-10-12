@@ -403,7 +403,7 @@ int main( int argc, char** argv )
 	const size_t runCount = 10000;
 	const bool fusedDepthwise = false;
 
-	std::unique_ptr<IMathEngine> mathEngine( CreateCpuMathEngine( 1, 0 ) );
+	std::unique_ptr<IMathEngine> mathEngine( CreateCpuMathEngine( 0, 0 ) );
 	engine dnnlEngine( engine::kind::cpu, 0 );
 	stream dnnlStream( dnnlEngine );
 
