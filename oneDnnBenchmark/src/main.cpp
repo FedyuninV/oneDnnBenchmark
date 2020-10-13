@@ -215,9 +215,11 @@ static memory addConv( CDnn& dnn, const CString& convName, const CString& channe
 	memory dwWeightMemory;
 	memory dwBiasMemory;
 	if( channelwiseOp != nullptr ) {
-		dwWeightMemory = convFilter( *channelwiseOp, dnnlEngine );
+		memory::desc dwWeightMd = convPd.query_md( query::exec_arg_md, DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_WEIGHTS );
+		dwWeightMemory = reorderIfNeeded( convFilter( *channelwiseOp, dnnlEngine ), dwWeightMd, fwd, fwdArgs, dnnlEngine );
 		if( !channelwiseOp->IsZeroFreeTerm() ) {
-			dwBiasMemory = convBias( *channelwiseOp, dnnlEngine );
+			memory::desc dwBiasMd = convPd.query_md( query::exec_arg_md, DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_BIAS );
+			dwBiasMemory = reorderIfNeeded( convBias( *channelwiseOp, dnnlEngine ), dwBiasMd, fwd, fwdArgs, dnnlEngine );
 		}
 	}
 	
@@ -265,10 +267,8 @@ static memory addBlock( CDnn& dnn, const CString& blockName, engine& dnnlEngine,
 		&& conv2->GetDilationHeight() == 1 && conv2->GetDilationWidth() == 1
 		&& conv2->GetFilterHeight() == 3 && conv2->GetFilterWidth() == 3 )
 	{
-		// TODO: Here DwConv is fused with Conv (after fixes)
-		// convOutput = addConv( dnn, blockName + "conv1", blockName + "conv2", true, dnnlEngine, input, fwd, fwdArgs );
-		convOutput = addConv( dnn, blockName + "conv1", true, dnnlEngine, input, fwd, fwdArgs );
-		convOutput = addConv( dnn, blockName + "conv2", true, dnnlEngine, convOutput, fwd, fwdArgs );
+		// Here DwConv is fused with Conv (after fixes)
+		convOutput = addConv( dnn, blockName + "conv1", blockName + "conv2", true, dnnlEngine, input, fwd, fwdArgs );
 	} else {
 		convOutput = addConv( dnn, blockName + "conv1", true, dnnlEngine, input, fwd, fwdArgs );
 		convOutput = addConv( dnn, blockName + "conv2", true, dnnlEngine, convOutput, fwd, fwdArgs );
@@ -293,8 +293,8 @@ static memory addMeanPooling( CDnn& dnn, const CString& poolName, engine& dnnlEn
 	CMeanPoolingLayer& pool = *dynamic_cast<CMeanPoolingLayer*>( dnn.GetLayer( poolName ).Ptr() );
 
 	memory::dims dstDim = input.get_desc().dims();
-	dstDim[2] = convOutputSize( static_cast< int >( dstDim[2] ), pool.GetFilterHeight(), pool.GetStrideHeight(), 0, 1 );
-	dstDim[3] = convOutputSize( static_cast< int >( dstDim[3] ), pool.GetFilterWidth(), pool.GetStrideWidth(), 0, 1 );
+	dstDim[2] = convOutputSize( static_cast<int>( dstDim[2] ), pool.GetFilterHeight(), pool.GetStrideHeight(), 0, 1 );
+	dstDim[3] = convOutputSize( static_cast<int>( dstDim[3] ), pool.GetFilterWidth(), pool.GetStrideWidth(), 0, 1 );
 	memory::desc dstMd( dstDim, memory::data_type::f32, memory::format_tag::any );
 
 	pooling_forward::desc poolDesc( prop_kind::forward_inference, algorithm::pooling_avg, input.get_desc(), dstMd,
@@ -394,9 +394,9 @@ int main( int argc, char** argv )
 {
 	const CString netName = "MobileNetV2Cifar10";
 	const CString inputName = "in";
-	const size_t runCount = 100;
+	const size_t runCount = 10000;
 
-	std::unique_ptr<IMathEngine> mathEngine( CreateCpuMathEngine( 1, 0 ) );
+	std::unique_ptr<IMathEngine> mathEngine( CreateCpuMathEngine( 0, 0 ) );
 	engine dnnlEngine( engine::kind::cpu, 0 );
 	stream dnnlStream( dnnlEngine );
 
