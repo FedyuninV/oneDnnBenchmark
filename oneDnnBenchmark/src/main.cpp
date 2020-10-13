@@ -61,14 +61,14 @@ static void copyFromDnnlMemory( const memory& src, std::vector<float>& dst )
 	}
 }
 
-static memory::desc no_format( const memory::desc& desc )
+static memory::desc noFormat( const memory::desc& desc )
 {
 	return memory::desc( desc.dims(), desc.data_type(), memory::format_tag::any );
 }
 
-static memory::desc no_format( const memory& mem )
+static memory::desc noFormat( const memory& mem )
 {
-	return no_format( mem.get_desc() );
+	return noFormat( mem.get_desc() );
 }
 
 static memory reorderIfNeeded( const memory& src, const memory::desc& dstDesc, std::vector<primitive>& fwd,
@@ -89,31 +89,26 @@ static convolution_forward::desc buildConvDesc( const CBaseConvLayer& conv, cons
 	CPtr<CDnnBlob> filter = conv.GetFilterData();
 	const bool isChannelwise = dynamic_cast<const CChannelwiseConvLayer*>( &conv ) != nullptr;
 
-	memory::desc srcMd( no_format( input ) );
+	memory::desc srcMd( noFormat( input ) );
 	memory::dims weightDim;
 	if( isChannelwise ) {
-		weightDim = { filter->GetObjectCount() * filter->GetChannelsCount(), 1, 1, filter->GetHeight(), filter->GetWidth() };
+		weightDim = { static_cast<memory::dim>( filter->GetObjectCount() ) * filter->GetChannelsCount(), 1, 1, filter->GetHeight(), filter->GetWidth() };
 	} else {
 		weightDim = { filter->GetObjectCount(), filter->GetChannelsCount(), filter->GetHeight(), filter->GetWidth() };
 	}
 	memory::desc weightMd( weightDim, memory::data_type::f32, memory::format_tag::any );
+	memory::desc biasMd;
 	memory::desc dstMd( dstDim, memory::data_type::f32, memory::format_tag::any );
 	
-	// TODO: test with direct instead of auto
-	algorithm convAlgo = algorithm::convolution_auto;
-
-	if( conv.IsZeroFreeTerm() ) {
-		return convolution_forward::desc( prop_kind::forward_inference, convAlgo, srcMd, weightMd, dstMd,
-			{ conv.GetStrideHeight(), conv.GetStrideWidth() }, { conv.GetPaddingHeight(), conv.GetPaddingWidth() },
-			{ conv.GetPaddingHeight(), conv.GetPaddingWidth() } );
-	} else {
-		CPtr<CDnnBlob> freeTerm = conv.GetFreeTermData();
-		memory::desc biasMd( { freeTerm->GetDataSize() }, memory::data_type::f32, memory::format_tag::any );
-		// TODO: test with direct instead of auto
-		return convolution_forward::desc( prop_kind::forward_inference, convAlgo, srcMd, weightMd, biasMd, dstMd,
-			{ conv.GetStrideHeight(), conv.GetStrideWidth() }, { conv.GetPaddingHeight(), conv.GetPaddingWidth() },
-			{ conv.GetPaddingHeight(), conv.GetPaddingWidth() } );
+	if( !conv.IsZeroFreeTerm() ) {
+		biasMd = memory::desc( { conv.GetFilterCount() }, memory::data_type::f32, memory::format_tag::any );
 	}
+
+	// TODO: test with direct instead of auto
+	return convolution_forward::desc( prop_kind::forward_inference, algorithm::convolution_auto,
+		srcMd, weightMd, biasMd, dstMd,
+		{ conv.GetStrideHeight(), conv.GetStrideWidth() }, { conv.GetPaddingHeight(), conv.GetPaddingWidth() },
+		{ conv.GetPaddingHeight(), conv.GetPaddingWidth() } );
 }
 
 static memory convFilter( const CBaseConvLayer& conv, engine& dnnlEngine )
@@ -148,8 +143,8 @@ static memory convBias( const CBaseConvLayer& conv, engine& dnnlEngine )
 	return biasMemory;
 }
 
-static memory addConv( CDnn& dnn, const CString& convName, const CString& channelwiseOpName, bool addReLU, engine& dnnlEngine, memory& input, memory& toAdd,
-	std::vector<primitive>& fwd, std::vector<std::unordered_map<int, memory>>& fwdArgs )
+static memory addConv( CDnn& dnn, const CString& convName, const CString& channelwiseOpName, bool addReLU, engine& dnnlEngine,
+	memory& input, memory& toAdd, std::vector<primitive>& fwd, std::vector<std::unordered_map<int, memory>>& fwdArgs )
 {
 	assert( dnn.HasLayer( convName ) );
 	CBaseConvLayer& conv = *dynamic_cast<CBaseConvLayer*>( dnn.GetLayer( convName ).Ptr() );
@@ -165,8 +160,8 @@ static memory addConv( CDnn& dnn, const CString& convName, const CString& channe
 		assert( channelwiseOp->GetStrideHeight() == channelwiseOp->GetStrideWidth()
 			&& ( channelwiseOp->GetStrideHeight() == 1 || channelwiseOp->GetStrideHeight() == 2 ) );
 		assert( channelwiseOp->GetPaddingHeight() == 1 && channelwiseOp->GetPaddingWidth() == 1 );
-		assert( channelwiseOp->IsZeroFreeTerm() );
 		assert( conv.GetFilterHeight() == 1 && conv.GetFilterWidth() == 1 );
+		assert( !channelwiseOp->IsZeroFreeTerm() );
 	}
 
 	memory::dims dstDims( input.get_desc().dims() );
@@ -178,12 +173,6 @@ static memory addConv( CDnn& dnn, const CString& convName, const CString& channe
 		conv.GetPaddingHeight(), conv.GetDilationHeight() );
 	dstDims[3] = convOutputSize( static_cast<int>( dstDims[3] ), conv.GetFilterWidth(), conv.GetStrideWidth(),
 		conv.GetPaddingWidth(), conv.GetDilationWidth() );
-	if( channelwiseOp != nullptr ) {
-		dstDims[2] = convOutputSize( static_cast< int >( dstDims[2] ), channelwiseOp->GetFilterHeight(), channelwiseOp->GetStrideHeight(),
-			channelwiseOp->GetPaddingHeight(), channelwiseOp->GetDilationHeight() );
-		dstDims[3] = convOutputSize( static_cast< int >( dstDims[3] ), channelwiseOp->GetFilterWidth(), channelwiseOp->GetStrideWidth(),
-			channelwiseOp->GetPaddingWidth(), channelwiseOp->GetDilationWidth() );
-	}
 
 	convolution_forward::desc convDesc = buildConvDesc( conv, input, dnnlEngine, dstDims );
 
@@ -194,9 +183,13 @@ static memory addConv( CDnn& dnn, const CString& convName, const CString& channe
 	}
 	if( channelwiseOp != nullptr ) {
 		if( channelwiseOp->GetStrideHeight() == 1 ) {
-			convPo.append_dw_k3s1p1( memory::data_type::f32, memory::data_type::f32, memory::data_type::f32, 0, {} );
+			convPo.append_dw_k3s1p1( memory::data_type::f32,
+				channelwiseOp->IsZeroFreeTerm() ? memory::data_type::undef : memory::data_type::f32,
+				memory::data_type::f32, 0, { 1.f } );
 		} else {
-			convPo.append_dw_k3s2p1( memory::data_type::f32, memory::data_type::f32, memory::data_type::f32, 0, {} );
+			convPo.append_dw_k3s2p1( memory::data_type::f32,
+				channelwiseOp->IsZeroFreeTerm() ? memory::data_type::undef : memory::data_type::f32,
+				memory::data_type::f32, 0, { 1.f } );
 		}
 		if( addReLU ) {
 			convPo.append_eltwise( 1.f, algorithm::eltwise_relu, 0.f, 0.f );
@@ -212,21 +205,46 @@ static memory addConv( CDnn& dnn, const CString& convName, const CString& channe
 
 	memory srcMemory = reorderIfNeeded( input, convPd.src_desc(), fwd, fwdArgs, dnnlEngine );
 	memory weightMemory = reorderIfNeeded( convFilter( conv, dnnlEngine ), convPd.weights_desc(), fwd, fwdArgs, dnnlEngine );
+	memory biasMemory;
 	memory dstMemory = toAdd == memory() ? memory( convPd.dst_desc(), dnnlEngine )
 		: reorderIfNeeded( toAdd, convPd.dst_desc(), fwd, fwdArgs, dnnlEngine );
+	if( !conv.IsZeroFreeTerm() ) {
+		biasMemory = reorderIfNeeded( convBias( conv, dnnlEngine ), convPd.bias_desc(), fwd, fwdArgs, dnnlEngine );
+	}
+
+	memory dwWeightMemory;
+	memory dwBiasMemory;
+	if( channelwiseOp != nullptr ) {
+		dwWeightMemory = convFilter( *channelwiseOp, dnnlEngine );
+		if( !channelwiseOp->IsZeroFreeTerm() ) {
+			dwBiasMemory = convBias( *channelwiseOp, dnnlEngine );
+		}
+	}
 	
 	fwd.push_back( convolution_forward( convPd ) );
-	fwdArgs.push_back( { { DNNL_ARG_SRC, srcMemory }, { DNNL_ARG_WEIGHTS, weightMemory }, { DNNL_ARG_DST, dstMemory } } );
-	if( !conv.IsZeroFreeTerm() ) {
-		memory biasMemory = reorderIfNeeded( convBias( conv, dnnlEngine ), convPd.bias_desc(), fwd, fwdArgs, dnnlEngine );
-		fwdArgs.back().insert( { DNNL_ARG_BIAS, biasMemory } );
-	}
-	if( channelwiseOp != nullptr ) {
-		memory dwPoMemory( { { conv.GetFilterCount(), 1, 1, 3, 3 }, memory::data_type::f32, memory::format_tag::goihw }, dnnlEngine );
-		copyToDnnlMemory( *channelwiseOp->GetFilterData(), dwPoMemory );
-		fwdArgs.back().insert( { DNNL_ARG_ATTR_POST_OP_DW, dwPoMemory } );
-	}
+	fwdArgs.push_back( { { DNNL_ARG_SRC, srcMemory }, { DNNL_ARG_WEIGHTS, weightMemory }, { DNNL_ARG_DST, dstMemory },
+		{ DNNL_ARG_BIAS, biasMemory }, { DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_WEIGHTS, dwWeightMemory },
+		{ DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_BIAS, dwBiasMemory } } );
+
 	return dstMemory;
+}
+
+static memory addConv( CDnn& dnn, const CString& convName, const CString& channelwiseOpName, bool addReLU, engine& dnnlEngine,
+	memory& input, std::vector<primitive>& fwd, std::vector<std::unordered_map<int, memory>>& fwdArgs )
+{
+	return addConv( dnn, convName, channelwiseOpName, addReLU, dnnlEngine, input, memory(), fwd, fwdArgs );
+}
+
+static memory addConv( CDnn& dnn, const CString& convName, bool addReLU, engine& dnnlEngine, memory& input, memory& toAdd,
+	std::vector<primitive>& fwd, std::vector<std::unordered_map<int, memory>>& fwdArgs )
+{
+	return addConv( dnn, convName, "", addReLU, dnnlEngine, input, toAdd, fwd, fwdArgs );
+}
+
+static memory addConv( CDnn& dnn, const CString& convName, bool addReLU, engine& dnnlEngine, memory& input,
+	std::vector<primitive>& fwd, std::vector<std::unordered_map<int, memory>>& fwdArgs )
+{
+	return addConv( dnn, convName, "", addReLU, dnnlEngine, input, memory(), fwd, fwdArgs );
 }
 
 static memory addBlock( CDnn& dnn, const CString& blockName, engine& dnnlEngine, memory& input,
@@ -241,12 +259,19 @@ static memory addBlock( CDnn& dnn, const CString& blockName, engine& dnnlEngine,
 	CPtr<CConvLayer> conv3 = CheckCast<CConvLayer>( dnn.GetLayer( blockName + "conv3" ) );
 
 	memory convOutput;
-	if( conv2->IsZeroFreeTerm() ) {
-		// HERE DwConv fused with Conv
-		convOutput = addConv( dnn, blockName + "conv1", blockName + "conv2", true, dnnlEngine, input, memory(), fwd, fwdArgs );
+	if( conv2->GetStrideHeight() == conv2->GetStrideWidth()
+		&& ( conv2->GetStrideWidth() == 1 || conv2->GetStrideWidth() == 2 )
+		&& conv2->GetPaddingHeight() == 1 && conv2->GetPaddingWidth() == 1
+		&& conv2->GetDilationHeight() == 1 && conv2->GetDilationWidth() == 1
+		&& conv2->GetFilterHeight() == 3 && conv2->GetFilterWidth() == 3 )
+	{
+		// TODO: Here DwConv is fused with Conv (after fixes)
+		// convOutput = addConv( dnn, blockName + "conv1", blockName + "conv2", true, dnnlEngine, input, fwd, fwdArgs );
+		convOutput = addConv( dnn, blockName + "conv1", true, dnnlEngine, input, fwd, fwdArgs );
+		convOutput = addConv( dnn, blockName + "conv2", true, dnnlEngine, convOutput, fwd, fwdArgs );
 	} else {
-		convOutput = addConv( dnn, blockName + "conv1", "", true, dnnlEngine, input, memory(), fwd, fwdArgs );
-		convOutput = addConv( dnn, blockName + "conv2", "", true, dnnlEngine, convOutput, memory(), fwd, fwdArgs );
+		convOutput = addConv( dnn, blockName + "conv1", true, dnnlEngine, input, fwd, fwdArgs );
+		convOutput = addConv( dnn, blockName + "conv2", true, dnnlEngine, convOutput, fwd, fwdArgs );
 	}
 
 	const int firstStride = conv2->GetStrideHeight();
@@ -258,7 +283,7 @@ static memory addBlock( CDnn& dnn, const CString& blockName, engine& dnnlEngine,
 		toSum = input;
 	}
 
-	return addConv( dnn, blockName + "conv3", "", false, dnnlEngine, convOutput, toSum, fwd, fwdArgs );
+	return addConv( dnn, blockName + "conv3", false, dnnlEngine, convOutput, toSum, fwd, fwdArgs );
 }
 
 static memory addMeanPooling( CDnn& dnn, const CString& poolName, engine& dnnlEngine, memory& input,
@@ -291,7 +316,7 @@ static memory addFc( CDnn& dnn, const CString& fcName, engine& dnnlEngine, memor
 	CFullyConnectedLayer& fc = *dynamic_cast<CFullyConnectedLayer*>( dnn.GetLayer( fcName ).Ptr() );
 	memory::dims srcDim = input.get_desc().dims();
 
-	memory::desc srcMd = no_format( input );
+	memory::desc srcMd = noFormat( input );
 	memory::desc weightMd( { fc.GetNumberOfElements(), srcDim[1], 1, 1 }, memory::data_type::f32, memory::format_tag::any );
 	memory::desc dstMd( { srcDim[0], fc.GetNumberOfElements() }, memory::data_type::f32, memory::format_tag::any );
 
@@ -365,45 +390,13 @@ CPtr<CDnnBlob> loadBlob( CDnn& dnn, const CString& netName, const CString& input
 	return inputBlob;
 }
 
-static void printNetInfo( const CDnn& dnn )
-{
-	CArray<const char*> layerNames;
-	dnn.GetLayerList( layerNames );
-
-	for( int i = 0; i < layerNames.Size(); ++i ) {
-		const CBaseLayer* layer = dnn.GetLayer( layerNames[i] );
-		if( dynamic_cast<const CSourceLayer*>( layer ) != nullptr ) {
-			printf( "%s:\t%s\n", "Source", layer->GetName() );
-		} else if( dynamic_cast<const CSinkLayer*>( layer ) != nullptr ) {
-			printf( "%s:\t%s\n", "Sink", layer->GetName() );
-		} else if( dynamic_cast<const CConvLayer*>( layer ) != nullptr ) {
-			printf( "%s:\t%s\t(%s)\n", "Conv", layer->GetName(), dynamic_cast<const CConvLayer*>( layer )->IsZeroFreeTerm() ? "true" : "false" );
-		} else if( dynamic_cast<const CChannelwiseConvLayer*>( layer ) != nullptr ) {
-			printf( "%s:\t%s\t(%s)\n", "ChannelwiseConv", layer->GetName(), dynamic_cast<const CChannelwiseConvLayer*>( layer )->IsZeroFreeTerm() ? "true" : "false" );
-		} else if( dynamic_cast<const CReLULayer*>( layer ) != nullptr ) {
-			printf( "%s:\t%s\t%f\n", "ReLU", layer->GetName(), dynamic_cast<const CReLULayer*>( layer )->GetUpperThreshold() );
-		} else if( dynamic_cast<const CEltwiseSumLayer*>( layer ) != nullptr ) {
-			printf( "%s:\t%s\n", "Sum", layer->GetName() );
-		} else if( dynamic_cast<const CFullyConnectedLayer*>( layer ) != nullptr ) {
-			printf( "%s:\t%s\n", "FC", layer->GetName() );
-		} else if( dynamic_cast<const CMaxPoolingLayer*>( layer ) != nullptr ) {
-			printf( "%s:\t%s\n", "MaxPool", layer->GetName() );
-		} else if( dynamic_cast<const CMeanPoolingLayer*>( layer ) != nullptr ) {
-			printf( "%s:\t%s\n", "MeanPool", layer->GetName() );
-		} else {
-			printf( "UNKNOWN:\t%s\n", layer->GetName() );
-		}
-	}
-}
-
 int main( int argc, char** argv )
 {
 	const CString netName = "MobileNetV2Cifar10";
 	const CString inputName = "in";
-	const size_t runCount = 10000;
-	const bool fusedDepthwise = false;
+	const size_t runCount = 100;
 
-	std::unique_ptr<IMathEngine> mathEngine( CreateCpuMathEngine( 0, 0 ) );
+	std::unique_ptr<IMathEngine> mathEngine( CreateCpuMathEngine( 1, 0 ) );
 	engine dnnlEngine( engine::kind::cpu, 0 );
 	stream dnnlStream( dnnlEngine );
 
@@ -411,21 +404,7 @@ int main( int argc, char** argv )
 	CDnn dnn( random, *mathEngine );
 
 	loadDnn( dnn, netName );
-	if( fusedDepthwise ) {
-		CArray<const char*> layerNames;
-		dnn.GetLayerList( layerNames );
-		for( int i = 0; i < layerNames.Size(); ++i ) {
-			CChannelwiseConvLayer* chConv = dynamic_cast<CChannelwiseConvLayer*>( dnn.GetLayer( layerNames[i] ).Ptr() );
-			if( chConv != nullptr ) {
-				CPtr<CDnnBlob> ft = chConv->GetFreeTermData();
-				ft->Clear();
-				chConv->SetFreeTermData( ft );
-				chConv->SetZeroFreeTerm( true );
-			}
-		}
-	}
-	printNetInfo( dnn );
-	
+
 	CPtr<CDnnBlob> inputBlob = loadBlob( dnn, netName, inputName );
 	memory input( { { inputBlob->GetObjectCount(), inputBlob->GetChannelsCount(), inputBlob->GetHeight(), inputBlob->GetWidth() },
 		memory::data_type::f32, memory::format_tag::nchw }, dnnlEngine );
@@ -433,7 +412,7 @@ int main( int argc, char** argv )
 
 	std::vector<primitive> fwd;
 	std::vector<std::unordered_map<int, memory>> fwdArgs;
-	memory output = addConv( dnn, "conv1", "", true, dnnlEngine, input, memory(), fwd, fwdArgs );
+	memory output = addConv( dnn, "conv1", true, dnnlEngine, input, fwd, fwdArgs );
 	output = addBlock( dnn, "block0", dnnlEngine, output, fwd, fwdArgs );
 	output = addBlock( dnn, "block10", dnnlEngine, output, fwd, fwdArgs );
 	output = addBlock( dnn, "block11", dnnlEngine, output, fwd, fwdArgs );
@@ -451,7 +430,7 @@ int main( int argc, char** argv )
 	output = addBlock( dnn, "block51", dnnlEngine, output, fwd, fwdArgs );
 	output = addBlock( dnn, "block52", dnnlEngine, output, fwd, fwdArgs );
 	output = addBlock( dnn, "block6", dnnlEngine, output, fwd, fwdArgs );
-	output = addConv( dnn, "conv2", "", true, dnnlEngine, output, memory(), fwd, fwdArgs );
+	output = addConv( dnn, "conv2", true, dnnlEngine, output, fwd, fwdArgs );
 	output = addMeanPooling( dnn, "pool", dnnlEngine, output, fwd, fwdArgs );
 	output = addFc( dnn, "fc", dnnlEngine, output, fwd, fwdArgs );
 	output = convertOutput( output, fwd, fwdArgs, dnnlEngine );
@@ -487,9 +466,9 @@ int main( int argc, char** argv )
 	}
 
 	CPtr<CSourceLayer> in = CheckCast<CSourceLayer>( dnn.GetLayer( "in" ) );
-	in->SetBlob( inputBlob );
 	CPtr<CSinkLayer> out = CheckCast<CSinkLayer>( dnn.GetLayer( "out" ) );
 
+	in->SetBlob( inputBlob );
 	dnn.RunOnce();
 	const CPtr<CDnnBlob>& outputBlob = out->GetBlob();
 	std::vector<float> expected( outputBlob->GetDataSize() );
