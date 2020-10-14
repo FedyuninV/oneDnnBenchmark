@@ -423,7 +423,8 @@ int main( int argc, char** argv )
 {
 	const CString netName = "MobileNetV2Cifar10";
 	const CString inputName = "in";
-	const size_t runCount = 10000;
+	const size_t runCount = 100;
+	const int imageSizeMultiplier = 16;
 	engine::kind engineKind = engine::kind::gpu;
 
 	std::unique_ptr<IMathEngine> mathEngine;
@@ -457,6 +458,18 @@ int main( int argc, char** argv )
 	loadDnn( dnn, netName );
 
 	CPtr<CDnnBlob> inputBlob = loadBlob( dnn, netName, inputName );
+	if( imageSizeMultiplier != 1 ) {
+		inputBlob = CDnnBlob::Create2DImageBlob( *mathEngine, CT_Float, 1, 1,
+			32 * imageSizeMultiplier, 32 * imageSizeMultiplier, 3 );
+		float* buff = inputBlob->GetBuffer<float>( 0, inputBlob->GetDataSize() );
+		for( int i = 0; i < inputBlob->GetDataSize(); ++i ) {
+			buff[i] = static_cast<float>( random.Uniform( -1, 2 ) );
+		}
+		inputBlob->ReleaseBuffer( buff, true );
+		CPtr<CMeanPoolingLayer> pool = CheckCast<CMeanPoolingLayer>( dnn.GetLayer( "pool" ) );
+		pool->SetFilterHeight( pool->GetFilterHeight() * imageSizeMultiplier );
+		pool->SetFilterWidth( pool->GetFilterWidth() * imageSizeMultiplier );
+	}
 	memory input( { { inputBlob->GetObjectCount(), inputBlob->GetChannelsCount(), inputBlob->GetHeight(), inputBlob->GetWidth() },
 		memory::data_type::f32, memory::format_tag::nchw }, dnnlEngine );
 	copyToDnnlMemory( *inputBlob, input );
