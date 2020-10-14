@@ -30,9 +30,23 @@ static void copyToDnnlMemory( const float* src, memory& dst )
 {
 	size_t bytes = dst.get_desc().get_size();
 	assert( bytes % sizeof( float ) == 0 );
-	float* dstBuffer = static_cast<float*>( dst.get_data_handle() );
-	for( size_t i = 0; i < bytes / sizeof( float ); ++i ) {
-		dstBuffer[i] = src[i];
+	engine dnnlEngine = dst.get_engine();
+	if( dnnlEngine.get_kind() == engine::kind::cpu ) {
+		float* dstBuffer = static_cast< float* >( dst.get_data_handle() );
+		for( size_t i = 0; i < bytes / sizeof( float ); ++i ) {
+			dstBuffer[i] = src[i];
+		}
+	} else if( dnnlEngine.get_kind() == engine::kind::gpu ) {
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+		stream dnnlStream( dnnlEngine );
+		cl_int ret = clEnqueueWriteBuffer( dnnlStream.get_ocl_command_queue(), dst.get_ocl_mem_object(),
+			CL_TRUE, 0, bytes, src, 0, nullptr, nullptr );
+		assert( ret == CL_SUCCESS );
+#else
+		assert( false );
+#endif
+	} else {
+		assert( false );
 	}
 }
 
@@ -55,9 +69,23 @@ static void copyFromDnnlMemory( const memory& src, std::vector<float>& dst )
 {
 	size_t bytes = src.get_desc().get_size();
 	assert( bytes == dst.size() * sizeof( float ) );
-	const float* srcBuffer = static_cast<const float*>( src.get_data_handle() );
-	for( size_t i = 0; i < dst.size(); ++i ) {
-		dst[i] = srcBuffer[i];
+	engine dnnlEngine = src.get_engine();
+	if( dnnlEngine.get_kind() == engine::kind::cpu ) {
+		const float* srcBuffer = static_cast< const float* >( src.get_data_handle() );
+		for( size_t i = 0; i < dst.size(); ++i ) {
+			dst[i] = srcBuffer[i];
+		}
+	} else if( dnnlEngine.get_kind() == engine::kind::gpu ) {
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+		stream dnnlStream( dnnlEngine );
+		cl_int ret = clEnqueueReadBuffer( dnnlStream.get_ocl_command_queue(), src.get_ocl_mem_object(),
+			CL_TRUE, 0, bytes, dst.data(), 0, nullptr, nullptr );
+		assert( ret == CL_SUCCESS );
+#else
+		assert( false );
+#endif
+	} else {
+		assert( false );
 	}
 }
 
@@ -261,7 +289,8 @@ static memory addBlock( CDnn& dnn, const CString& blockName, engine& dnnlEngine,
 	CPtr<CConvLayer> conv3 = CheckCast<CConvLayer>( dnn.GetLayer( blockName + "conv3" ) );
 
 	memory convOutput;
-	if( conv2->GetStrideHeight() == conv2->GetStrideWidth()
+	if( dnnlEngine.get_kind() == engine::kind::cpu
+		&& conv2->GetStrideHeight() == conv2->GetStrideWidth()
 		&& ( conv2->GetStrideWidth() == 1 || conv2->GetStrideWidth() == 2 )
 		&& conv2->GetPaddingHeight() == 1 && conv2->GetPaddingWidth() == 1
 		&& conv2->GetDilationHeight() == 1 && conv2->GetDilationWidth() == 1
@@ -395,9 +424,31 @@ int main( int argc, char** argv )
 	const CString netName = "MobileNetV2Cifar10";
 	const CString inputName = "in";
 	const size_t runCount = 10000;
+	engine::kind engineKind = engine::kind::gpu;
 
-	std::unique_ptr<IMathEngine> mathEngine( CreateCpuMathEngine( 0, 0 ) );
-	engine dnnlEngine( engine::kind::cpu, 0 );
+	std::unique_ptr<IMathEngine> mathEngine;
+	if( engineKind == engine::kind::cpu ) {
+		mathEngine.reset( CreateCpuMathEngine( 0, 0 ) );
+	} else {
+		std::unique_ptr<IGpuMathEngineManager> manager( CreateGpuMathEngineManager() );
+		const int gpuMathEngineCount = manager->GetMathEngineCount();
+		for( int i = 0; i < gpuMathEngineCount; ++i ) {
+			CMathEngineInfo mathEngineInfo;
+			manager->GetMathEngineInfo( i, mathEngineInfo );
+			if( mathEngineInfo.Type == MET_Vulkan && std::string( mathEngineInfo.Name ).substr( 0, 5 ) == "Intel" ) {
+				std::cout << "GPU:\t" << mathEngineInfo.Name << std::endl;
+				mathEngine.reset( manager->CreateMathEngine( i, 0 ) );
+				break;
+			}
+		}
+	}
+
+	if( mathEngine == nullptr ) {
+		std::cerr << "Failed to create mathEngine" << std::endl;
+		return 1;
+	}
+
+	engine dnnlEngine( engineKind, 0 );
 	stream dnnlStream( dnnlEngine );
 
 	CRandom random( 0x54 );
