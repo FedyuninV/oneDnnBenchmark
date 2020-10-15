@@ -89,8 +89,9 @@ static void copyToDnnlMemory( const float* src, memory& dst )
 	}
 }
 
-static void copyToDnnlMemory( CDnnBlob& src, memory& dst )
+static void copyToDnnlMemory( const CDnnBlob& _src, memory& dst )
 {
+	CDnnBlob& src = const_cast<CDnnBlob&>( _src );
 	if( src.GetHeight() * src.GetWidth() == 1 || src.GetChannelsCount() == 1 ) {
 		float* buffer = src.GetBuffer<float>( 0, src.GetDataSize() );
 		copyToDnnlMemory( buffer, dst );
@@ -208,18 +209,18 @@ static memory convBias( const CBaseConvLayer& conv, engine& dnnlEngine )
 	return biasMemory;
 }
 
-static memory addConv( CDnn& dnn, const CString& convName, const CString& channelwiseOpName, bool addReLU,
+static memory addConv( const CDnn& dnn, const CString& convName, const CString& channelwiseOpName, bool addReLU,
 	memory& input, memory& toAdd, CDnnlNet& net )
 {
 	assert( dnn.HasLayer( convName ) );
-	CBaseConvLayer& conv = *dynamic_cast<CBaseConvLayer*>( dnn.GetLayer( convName ).Ptr() );
-	const bool isChannelwise = dynamic_cast<CChannelwiseConvLayer*>( &conv ) != nullptr;
+	const CBaseConvLayer& conv = *dynamic_cast<const CBaseConvLayer*>( dnn.GetLayer( convName ).Ptr() );
+	const bool isChannelwise = dynamic_cast<const CChannelwiseConvLayer*>( &conv ) != nullptr;
 
-	CChannelwiseConvLayer* channelwiseOp = nullptr;
+	const CChannelwiseConvLayer* channelwiseOp = nullptr;
 	if( channelwiseOpName != "" ) {
 		assert( dnn.HasLayer( channelwiseOpName ) );
 		assert( !isChannelwise );
-		channelwiseOp = dynamic_cast<CChannelwiseConvLayer*>( dnn.GetLayer( channelwiseOpName ).Ptr() );
+		channelwiseOp = dynamic_cast<const CChannelwiseConvLayer*>( dnn.GetLayer( channelwiseOpName ).Ptr() );
 		assert( channelwiseOp != nullptr );
 		assert( channelwiseOp->GetFilterHeight() == 3 && channelwiseOp->GetFilterWidth() == 3 );
 		assert( channelwiseOp->GetStrideHeight() == channelwiseOp->GetStrideWidth()
@@ -296,31 +297,31 @@ static memory addConv( CDnn& dnn, const CString& convName, const CString& channe
 	return dstMemory;
 }
 
-static memory addConv( CDnn& dnn, const CString& convName, const CString& channelwiseOpName, bool addReLU,
+static memory addConv( const CDnn& dnn, const CString& convName, const CString& channelwiseOpName, bool addReLU,
 	memory& input, CDnnlNet& net )
 {
 	return addConv( dnn, convName, channelwiseOpName, addReLU, input, memory(), net );
 }
 
-static memory addConv( CDnn& dnn, const CString& convName, bool addReLU, memory& input, memory& toAdd, CDnnlNet& net )
+static memory addConv( const CDnn& dnn, const CString& convName, bool addReLU, memory& input, memory& toAdd, CDnnlNet& net )
 {
 	return addConv( dnn, convName, "", addReLU, input, toAdd, net );
 }
 
-static memory addConv( CDnn& dnn, const CString& convName, bool addReLU, memory& input, CDnnlNet& net )
+static memory addConv( const CDnn& dnn, const CString& convName, bool addReLU, memory& input, CDnnlNet& net )
 {
 	return addConv( dnn, convName, "", addReLU, input, memory(), net );
 }
 
-static memory addBlock( CDnn& dnn, const CString& blockName, memory& input, CDnnlNet& net )
+static memory addBlock( const CDnn& dnn, const CString& blockName, memory& input, CDnnlNet& net )
 {
 	assert( dnn.HasLayer( blockName + "conv1" ) );
 	assert( dnn.HasLayer( blockName + "conv2" ) );
 	assert( dnn.HasLayer( blockName + "conv3" ) );
 
-	CPtr<CConvLayer> conv1 = CheckCast<CConvLayer>( dnn.GetLayer( blockName + "conv1" ) );
-	CPtr<CChannelwiseConvLayer> conv2 = CheckCast<CChannelwiseConvLayer>( dnn.GetLayer( blockName + "conv2" ) );
-	CPtr<CConvLayer> conv3 = CheckCast<CConvLayer>( dnn.GetLayer( blockName + "conv3" ) );
+	CPtr<const CConvLayer> conv1 = CheckCast<const CConvLayer>( dnn.GetLayer( blockName + "conv1" ) );
+	CPtr<const CChannelwiseConvLayer> conv2 = CheckCast<const CChannelwiseConvLayer>( dnn.GetLayer( blockName + "conv2" ) );
+	CPtr<const CConvLayer> conv3 = CheckCast<const CConvLayer>( dnn.GetLayer( blockName + "conv3" ) );
 
 	memory convOutput;
 	if( net.Engine().get_kind() == engine::kind::cpu
@@ -349,10 +350,10 @@ static memory addBlock( CDnn& dnn, const CString& blockName, memory& input, CDnn
 	return addConv( dnn, blockName + "conv3", false, convOutput, toSum, net );
 }
 
-static memory addMeanPooling( CDnn& dnn, const CString& poolName, memory& input, CDnnlNet& net )
+static memory addMeanPooling( const CDnn& dnn, const CString& poolName, memory& input, CDnnlNet& net )
 {
 	assert( dnn.HasLayer( poolName ) );
-	CMeanPoolingLayer& pool = *dynamic_cast<CMeanPoolingLayer*>( dnn.GetLayer( poolName ).Ptr() );
+	const CMeanPoolingLayer& pool = *dynamic_cast<const CMeanPoolingLayer*>( dnn.GetLayer( poolName ).Ptr() );
 
 	memory::dims dstDim = input.get_desc().dims();
 	dstDim[2] = convOutputSize( static_cast<int>( dstDim[2] ), pool.GetFilterHeight(), pool.GetStrideHeight(), 0, 1 );
@@ -370,10 +371,10 @@ static memory addMeanPooling( CDnn& dnn, const CString& poolName, memory& input,
 	return dstMemory;
 }
 
-static memory addFc( CDnn& dnn, const CString& fcName, memory& input, CDnnlNet& net )
+static memory addFc( const CDnn& dnn, const CString& fcName, memory& input, CDnnlNet& net )
 {
 	assert( dnn.HasLayer( fcName ) );
-	CFullyConnectedLayer& fc = *dynamic_cast<CFullyConnectedLayer*>( dnn.GetLayer( fcName ).Ptr() );
+	const CFullyConnectedLayer& fc = *dynamic_cast<const CFullyConnectedLayer*>( dnn.GetLayer( fcName ).Ptr() );
 	memory::dims srcDim = input.get_desc().dims();
 
 	memory::desc srcMd = noFormat( input );
@@ -437,73 +438,8 @@ static void loadDnn( CDnn& dnn, const CString& netName )
 	file.Close();
 }
 
-CPtr<CDnnBlob> loadBlob( CDnn& dnn, const CString& netName, const CString& inputName )
+static memory buildDnnlNet( const CDnn& dnn, memory& input, CDnnlNet& net )
 {
-	CPtr<CDnnBlob> inputBlob = new CDnnBlob( dnn.GetMathEngine() );
-	CArchiveFile file( netName + "." + inputName + ".input", CArchive::load );
-	CArchive archive( &file, CArchive::load );
-	inputBlob->Serialize( archive );
-	archive.Close();
-	file.Close();
-	CheckCast<CSourceLayer>( dnn.GetLayer( inputName ) )->SetBlob( inputBlob );
-	return inputBlob;
-}
-
-int main( int argc, char** argv )
-{
-	const CString netName = "MobileNetV2Cifar10";
-	const CString inputName = "in";
-	const size_t runCount = 100;
-	const int imageSizeMultiplier = 16;
-	engine::kind engineKind = engine::kind::cpu;
-
-	std::unique_ptr<IMathEngine> mathEngine;
-	if( engineKind == engine::kind::cpu ) {
-		mathEngine.reset( CreateCpuMathEngine( 0, 0 ) );
-	} else {
-		std::unique_ptr<IGpuMathEngineManager> manager( CreateGpuMathEngineManager() );
-		const int gpuMathEngineCount = manager->GetMathEngineCount();
-		for( int i = 0; i < gpuMathEngineCount; ++i ) {
-			CMathEngineInfo mathEngineInfo;
-			manager->GetMathEngineInfo( i, mathEngineInfo );
-			if( mathEngineInfo.Type == MET_Vulkan && std::string( mathEngineInfo.Name ).substr( 0, 5 ) == "Intel" ) {
-				std::cout << "GPU:\t" << mathEngineInfo.Name << std::endl;
-				mathEngine.reset( manager->CreateMathEngine( i, 0 ) );
-				break;
-			}
-		}
-	}
-
-	if( mathEngine == nullptr ) {
-		std::cerr << "Failed to create mathEngine" << std::endl;
-		return 1;
-	}
-
-	CDnnlNet net( engineKind );
-
-	CRandom random( 0x54 );
-	CDnn dnn( random, *mathEngine );
-
-	loadDnn( dnn, netName );
-
-	CPtr<CDnnBlob> inputBlob = loadBlob( dnn, netName, inputName );
-	if( imageSizeMultiplier != 1 ) {
-		inputBlob = CDnnBlob::Create2DImageBlob( *mathEngine, CT_Float, 1, 1,
-			32 * imageSizeMultiplier, 32 * imageSizeMultiplier, 3 );
-		float* buff = inputBlob->GetBuffer<float>( 0, inputBlob->GetDataSize() );
-		for( int i = 0; i < inputBlob->GetDataSize(); ++i ) {
-			buff[i] = static_cast<float>( random.Uniform( -1, 2 ) );
-		}
-		inputBlob->ReleaseBuffer( buff, true );
-		CPtr<CMeanPoolingLayer> pool = CheckCast<CMeanPoolingLayer>( dnn.GetLayer( "pool" ) );
-		pool->SetFilterHeight( pool->GetFilterHeight() * imageSizeMultiplier );
-		pool->SetFilterWidth( pool->GetFilterWidth() * imageSizeMultiplier );
-	}
-
-	memory input( { { inputBlob->GetObjectCount(), inputBlob->GetChannelsCount(), inputBlob->GetHeight(), inputBlob->GetWidth() },
-		memory::data_type::f32, memory::format_tag::nchw }, net.Engine() );
-	copyToDnnlMemory( *inputBlob, input );
-
 	memory output = addConv( dnn, "conv1", true, input, net );
 	output = addBlock( dnn, "block0", output, net );
 	output = addBlock( dnn, "block10", output, net );
@@ -525,24 +461,77 @@ int main( int argc, char** argv )
 	output = addConv( dnn, "conv2", true, output, net );
 	output = addMeanPooling( dnn, "pool", output, net );
 	output = addFc( dnn, "fc", output, net );
-	output = convertOutput( output, net );
+	return convertOutput( output, net );
+}
+
+static void adaptPoolSize( size_t originalSize, size_t actualSize, CDnn& dnn, const CString& poolName )
+{
+	assert( actualSize % originalSize == 0 );
+	const int maltiplier = actualSize / originalSize;
+	if( maltiplier != 1 ) {
+		CPtr<CPoolingLayer> pool = CheckCast<CPoolingLayer>( dnn.GetLayer( poolName ) );
+		pool->SetFilterHeight( pool->GetFilterHeight() * maltiplier );
+		pool->SetFilterWidth( pool->GetFilterWidth() * maltiplier );
+	}
+}
+
+static CDnnBlob* createInputBlob( IMathEngine& mathEngine, CRandom& random, const int imageSize )
+{
+	CDnnBlob* blob = CDnnBlob::Create2DImageBlob( mathEngine, CT_Float, 1, 1, imageSize, imageSize, 3 );
+	float* buff = blob->GetBuffer<float>( 0, blob->GetDataSize() );
+	for( int i = 0; i < blob->GetDataSize(); ++i ) {
+		buff[i] = static_cast<float>( random.Uniform( -1, 2 ) );
+	}
+	blob->ReleaseBuffer( buff, true );
+	return blob;
+}
+
+static IMathEngine* createMathEngine( engine::kind engineKind )
+{
+	if( engineKind == engine::kind::cpu ) {
+		return CreateCpuMathEngine( 0, 0 );
+	} else {
+		std::unique_ptr<IGpuMathEngineManager> manager( CreateGpuMathEngineManager() );
+		const int gpuMathEngineCount = manager->GetMathEngineCount();
+		for( int i = 0; i < gpuMathEngineCount; ++i ) {
+			CMathEngineInfo mathEngineInfo;
+			manager->GetMathEngineInfo( i, mathEngineInfo );
+			if( mathEngineInfo.Type == MET_Vulkan && std::string( mathEngineInfo.Name ).substr( 0, 5 ) == "Intel" ) {
+				std::cout << "GPU:\t" << mathEngineInfo.Name << std::endl;
+				return manager->CreateMathEngine( i, 0 );
+				break;
+			}
+		}
+	}
+	return nullptr;
+}
+
+static std::vector<float> testDnnl( engine::kind engineKind, const CDnn& dnn, const CDnnBlob& inputBlob, size_t runCount )
+{
+	CDnnlNet net( engineKind );
+	memory input( { { inputBlob.GetObjectCount(), inputBlob.GetChannelsCount(), inputBlob.GetHeight(), inputBlob.GetWidth() },
+		memory::data_type::f32, memory::format_tag::nchw }, net.Engine() );
+	copyToDnnlMemory( inputBlob, input );
+
+	memory output = buildDnnlNet( dnn, input, net );
 
 	const size_t outputBytes = output.get_desc().get_size();
 	assert( outputBytes % sizeof( float ) == 0 );
-	std::vector<float> actual( outputBytes / sizeof( float ) );
+	std::vector<float> result( outputBytes / sizeof( float ) );
 
 	net.Execute();
-	copyFromDnnlMemory( output, actual );
+	copyFromDnnlMemory( output, result );
 
+	std::vector<float> buff( result.size() );
 	{
 		auto counters = dnn.GetMathEngine().CreatePerformanceCounters();
 		counters->Synchronise();
 
 		for( size_t run = 1; run <= runCount; ++run ) {
 			net.Execute();
-			copyFromDnnlMemory( output, actual );
+			copyFromDnnlMemory( output, buff );
 		}
-
+		
 		counters->Synchronise();
 		std::cout << "*** ONE DNN ***" << std::endl;
 		for( const auto& counter : *counters ) {
@@ -551,15 +540,21 @@ int main( int argc, char** argv )
 		std::cout << std::endl;
 	}
 
+	return result;
+}
+
+static std::vector<float> testNeoML( CDnn& dnn, CDnnBlob& inputBlob, const CString& inputName, const CString& outputName,
+	size_t runCount )
+{
 	CPtr<CSourceLayer> in = CheckCast<CSourceLayer>( dnn.GetLayer( "in" ) );
 	CPtr<CSinkLayer> out = CheckCast<CSinkLayer>( dnn.GetLayer( "out" ) );
 
-	in->SetBlob( inputBlob );
+	in->SetBlob( &inputBlob );
 	dnn.RunOnce();
 	const CPtr<CDnnBlob>& outputBlob = out->GetBlob();
-	std::vector<float> expected( outputBlob->GetDataSize() );
+	std::vector<float> result( outputBlob->GetDataSize() );
 	float* buffer = outputBlob->GetBuffer<float>( 0, outputBlob->GetDataSize() );
-	repackToChannelFirst( outputBlob->GetDesc(), buffer, expected.data() );
+	repackToChannelFirst( outputBlob->GetDesc(), buffer, result.data() );
 	outputBlob->ReleaseBuffer( buffer, false );
 
 	std::vector<float> buff( outputBlob->GetDataSize() );
@@ -580,13 +575,45 @@ int main( int argc, char** argv )
 		std::cout << std::endl;
 	}
 
-	float maxAbsErr = 0;
-	assert( expected.size() == actual.size() );
-	for( size_t i = 0; i < expected.size(); ++i ) {
-		maxAbsErr = max( maxAbsErr, fabsf( expected[i] - actual[i] ) );
-	}
+	return result;
+}
 
-	std::cout << "Max abs err: " << maxAbsErr << std::endl;
+int main( int argc, char** argv )
+{
+	try {
+		const CString netName = "MobileNetV2Cifar10";
+		const size_t runCount = 100;
+		const int imageSize = 512;
+		engine::kind engineKind = engine::kind::cpu;
+
+		std::unique_ptr<IMathEngine> mathEngine( createMathEngine( engineKind ) );
+		if( mathEngine == nullptr ) {
+			std::cerr << "Failed to create mathEngine" << std::endl;
+			return 1;
+		}
+
+		CRandom random( 0x54 );
+		CDnn dnn( random, *mathEngine );
+
+		loadDnn( dnn, netName );
+
+		CPtr<CDnnBlob> inputBlob = createInputBlob( *mathEngine, random, imageSize );
+		adaptPoolSize( 32, imageSize, dnn, "pool" );
+
+		std::vector<float> actual = testDnnl( engineKind, dnn, *inputBlob, runCount );
+		std::vector<float> expected = testNeoML( dnn, *inputBlob, "in", "out", runCount );
+
+		float maxAbsErr = 0;
+		assert( expected.size() == actual.size() );
+		for( size_t i = 0; i < expected.size(); ++i ) {
+			maxAbsErr = max( maxAbsErr, fabsf( expected[i] - actual[i] ) );
+		}
+
+		std::cout << "Max abs err: " << maxAbsErr << std::endl;
+	} catch( std::exception& ex ) {
+		std::cerr << "Exception: " << ex.what() << std::endl;
+		return 1;
+	}
 
 	return 0;
 }
