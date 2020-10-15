@@ -6,6 +6,45 @@
 
 using namespace dnnl;
 
+typedef std::unordered_map<int, memory> primitiveArg;
+
+class CDnnlNet {
+public:
+	explicit CDnnlNet( engine::kind kind );
+
+	const engine& Engine() const { return dnnlEngine; }
+	engine& Engine() { return dnnlEngine; }
+
+	primitive& LastPrimitive() { assert( !primitives.empty() ); return primitives.back(); }
+	primitiveArg& LastArg() { assert( !args.empty() ); return args.back(); }
+
+	void AddPrimitive( const primitive& p, const primitiveArg& arg ) { primitives.push_back( p ); args.push_back( arg ); }
+	void AddPrimitive( primitive&& p, primitiveArg&& arg ) { primitives.push_back( p ); args.push_back( arg ); }
+
+	void Execute();
+
+private:
+	engine dnnlEngine;
+	stream dnnlStream;
+	std::vector<primitive> primitives;
+	std::vector<primitiveArg> args;
+};
+
+CDnnlNet::CDnnlNet( engine::kind kind ) :
+	dnnlEngine( kind, 0 ),
+	dnnlStream( dnnlEngine )
+{
+}
+
+void CDnnlNet::Execute()
+{
+	assert( primitives.size() == args.size() );
+	for( size_t i = 0; i < primitives.size(); ++i ) {
+		primitives[i].execute( dnnlStream, args[i] );
+	}
+	dnnlStream.wait();
+}
+
 static int convOutputSize( int inputSize, int filterSize, int stride, int padding, int dilation )
 {
 	assert( dilation == 1 );
@@ -99,16 +138,14 @@ static memory::desc noFormat( const memory& mem )
 	return noFormat( mem.get_desc() );
 }
 
-static memory reorderIfNeeded( const memory& src, const memory::desc& dstDesc, std::vector<primitive>& fwd,
-	std::vector<std::unordered_map<int, memory>>& fwdArgs, engine& dnnlEngine )
+static memory reorderIfNeeded( const memory& src, const memory::desc& dstDesc, CDnnlNet& net )
 {
 	if( src.get_desc() == dstDesc ) {
 		return src;
 	}
 
-	memory result( dstDesc, dnnlEngine );
-	fwd.push_back( reorder( src, result ) );
-	fwdArgs.push_back( { { DNNL_ARG_FROM, src }, { DNNL_ARG_TO, result } } );
+	memory result( dstDesc, net.Engine() );
+	net.AddPrimitive( reorder( src, result ), { { DNNL_ARG_FROM, src }, { DNNL_ARG_TO, result } } );
 	return result;
 }
 
@@ -171,8 +208,8 @@ static memory convBias( const CBaseConvLayer& conv, engine& dnnlEngine )
 	return biasMemory;
 }
 
-static memory addConv( CDnn& dnn, const CString& convName, const CString& channelwiseOpName, bool addReLU, engine& dnnlEngine,
-	memory& input, memory& toAdd, std::vector<primitive>& fwd, std::vector<std::unordered_map<int, memory>>& fwdArgs )
+static memory addConv( CDnn& dnn, const CString& convName, const CString& channelwiseOpName, bool addReLU,
+	memory& input, memory& toAdd, CDnnlNet& net )
 {
 	assert( dnn.HasLayer( convName ) );
 	CBaseConvLayer& conv = *dynamic_cast<CBaseConvLayer*>( dnn.GetLayer( convName ).Ptr() );
@@ -202,7 +239,7 @@ static memory addConv( CDnn& dnn, const CString& convName, const CString& channe
 	dstDims[3] = convOutputSize( static_cast<int>( dstDims[3] ), conv.GetFilterWidth(), conv.GetStrideWidth(),
 		conv.GetPaddingWidth(), conv.GetDilationWidth() );
 
-	convolution_forward::desc convDesc = buildConvDesc( conv, input, dnnlEngine, dstDims );
+	convolution_forward::desc convDesc = buildConvDesc( conv, input, net.Engine(), dstDims );
 
 	// Add post-ops if needed
 	dnnl::post_ops convPo;
@@ -229,56 +266,53 @@ static memory addConv( CDnn& dnn, const CString& convName, const CString& channe
 
 	primitive_attr convPa;
 	convPa.set_post_ops( convPo );
-	convolution_forward::primitive_desc convPd( convDesc, convPa, dnnlEngine );
+	convolution_forward::primitive_desc convPd( convDesc, convPa, net.Engine() );
 
-	memory srcMemory = reorderIfNeeded( input, convPd.src_desc(), fwd, fwdArgs, dnnlEngine );
-	memory weightMemory = reorderIfNeeded( convFilter( conv, dnnlEngine ), convPd.weights_desc(), fwd, fwdArgs, dnnlEngine );
+	memory srcMemory = reorderIfNeeded( input, convPd.src_desc(), net );
+	memory weightMemory = reorderIfNeeded( convFilter( conv, net.Engine() ), convPd.weights_desc(), net );
 	memory biasMemory;
-	memory dstMemory = toAdd == memory() ? memory( convPd.dst_desc(), dnnlEngine )
-		: reorderIfNeeded( toAdd, convPd.dst_desc(), fwd, fwdArgs, dnnlEngine );
+	memory dstMemory = toAdd == memory() ? memory( convPd.dst_desc(), net.Engine() )
+		: reorderIfNeeded( toAdd, convPd.dst_desc(), net );
 	if( !conv.IsZeroFreeTerm() ) {
-		biasMemory = reorderIfNeeded( convBias( conv, dnnlEngine ), convPd.bias_desc(), fwd, fwdArgs, dnnlEngine );
+		biasMemory = reorderIfNeeded( convBias( conv, net.Engine() ), convPd.bias_desc(), net );
 	}
 
 	memory dwWeightMemory;
 	memory dwBiasMemory;
 	if( channelwiseOp != nullptr ) {
 		memory::desc dwWeightMd = convPd.query_md( query::exec_arg_md, DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_WEIGHTS );
-		dwWeightMemory = reorderIfNeeded( convFilter( *channelwiseOp, dnnlEngine ), dwWeightMd, fwd, fwdArgs, dnnlEngine );
+		dwWeightMemory = reorderIfNeeded( convFilter( *channelwiseOp, net.Engine() ), dwWeightMd, net );
 		if( !channelwiseOp->IsZeroFreeTerm() ) {
 			memory::desc dwBiasMd = convPd.query_md( query::exec_arg_md, DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_BIAS );
-			dwBiasMemory = reorderIfNeeded( convBias( *channelwiseOp, dnnlEngine ), dwBiasMd, fwd, fwdArgs, dnnlEngine );
+			dwBiasMemory = reorderIfNeeded( convBias( *channelwiseOp, net.Engine() ), dwBiasMd, net );
 		}
 	}
 	
-	fwd.push_back( convolution_forward( convPd ) );
-	fwdArgs.push_back( { { DNNL_ARG_SRC, srcMemory }, { DNNL_ARG_WEIGHTS, weightMemory }, { DNNL_ARG_DST, dstMemory },
-		{ DNNL_ARG_BIAS, biasMemory }, { DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_WEIGHTS, dwWeightMemory },
-		{ DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_BIAS, dwBiasMemory } } );
+	net.AddPrimitive( convolution_forward( convPd ),
+		{ { DNNL_ARG_SRC, srcMemory }, { DNNL_ARG_WEIGHTS, weightMemory }, { DNNL_ARG_DST, dstMemory },
+			{ DNNL_ARG_BIAS, biasMemory }, { DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_WEIGHTS, dwWeightMemory },
+			{ DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_BIAS, dwBiasMemory } } );
 
 	return dstMemory;
 }
 
-static memory addConv( CDnn& dnn, const CString& convName, const CString& channelwiseOpName, bool addReLU, engine& dnnlEngine,
-	memory& input, std::vector<primitive>& fwd, std::vector<std::unordered_map<int, memory>>& fwdArgs )
+static memory addConv( CDnn& dnn, const CString& convName, const CString& channelwiseOpName, bool addReLU,
+	memory& input, CDnnlNet& net )
 {
-	return addConv( dnn, convName, channelwiseOpName, addReLU, dnnlEngine, input, memory(), fwd, fwdArgs );
+	return addConv( dnn, convName, channelwiseOpName, addReLU, input, memory(), net );
 }
 
-static memory addConv( CDnn& dnn, const CString& convName, bool addReLU, engine& dnnlEngine, memory& input, memory& toAdd,
-	std::vector<primitive>& fwd, std::vector<std::unordered_map<int, memory>>& fwdArgs )
+static memory addConv( CDnn& dnn, const CString& convName, bool addReLU, memory& input, memory& toAdd, CDnnlNet& net )
 {
-	return addConv( dnn, convName, "", addReLU, dnnlEngine, input, toAdd, fwd, fwdArgs );
+	return addConv( dnn, convName, "", addReLU, input, toAdd, net );
 }
 
-static memory addConv( CDnn& dnn, const CString& convName, bool addReLU, engine& dnnlEngine, memory& input,
-	std::vector<primitive>& fwd, std::vector<std::unordered_map<int, memory>>& fwdArgs )
+static memory addConv( CDnn& dnn, const CString& convName, bool addReLU, memory& input, CDnnlNet& net )
 {
-	return addConv( dnn, convName, "", addReLU, dnnlEngine, input, memory(), fwd, fwdArgs );
+	return addConv( dnn, convName, "", addReLU, input, memory(), net );
 }
 
-static memory addBlock( CDnn& dnn, const CString& blockName, engine& dnnlEngine, memory& input,
-	std::vector<primitive>& fwd, std::vector<std::unordered_map<int, memory>>& fwdArgs )
+static memory addBlock( CDnn& dnn, const CString& blockName, memory& input, CDnnlNet& net )
 {
 	assert( dnn.HasLayer( blockName + "conv1" ) );
 	assert( dnn.HasLayer( blockName + "conv2" ) );
@@ -289,7 +323,7 @@ static memory addBlock( CDnn& dnn, const CString& blockName, engine& dnnlEngine,
 	CPtr<CConvLayer> conv3 = CheckCast<CConvLayer>( dnn.GetLayer( blockName + "conv3" ) );
 
 	memory convOutput;
-	if( dnnlEngine.get_kind() == engine::kind::cpu
+	if( net.Engine().get_kind() == engine::kind::cpu
 		&& conv2->GetStrideHeight() == conv2->GetStrideWidth()
 		&& ( conv2->GetStrideWidth() == 1 || conv2->GetStrideWidth() == 2 )
 		&& conv2->GetPaddingHeight() == 1 && conv2->GetPaddingWidth() == 1
@@ -297,26 +331,25 @@ static memory addBlock( CDnn& dnn, const CString& blockName, engine& dnnlEngine,
 		&& conv2->GetFilterHeight() == 3 && conv2->GetFilterWidth() == 3 )
 	{
 		// Here DwConv is fused with Conv (after fixes)
-		convOutput = addConv( dnn, blockName + "conv1", blockName + "conv2", true, dnnlEngine, input, fwd, fwdArgs );
+		convOutput = addConv( dnn, blockName + "conv1", blockName + "conv2", true, input, net );
 	} else {
-		convOutput = addConv( dnn, blockName + "conv1", true, dnnlEngine, input, fwd, fwdArgs );
-		convOutput = addConv( dnn, blockName + "conv2", true, dnnlEngine, convOutput, fwd, fwdArgs );
+		convOutput = addConv( dnn, blockName + "conv1", true, input, net );
+		convOutput = addConv( dnn, blockName + "conv2", true, convOutput, net );
 	}
 
 	const int firstStride = conv2->GetStrideHeight();
 	const CString shortcutName = blockName + "convShortcut";
 	memory toSum;
 	if( firstStride == 1 && dnn.HasLayer( shortcutName ) ) {
-		toSum = addConv( dnn, shortcutName, "", false, dnnlEngine, input, memory(), fwd, fwdArgs );
+		toSum = addConv( dnn, shortcutName, "", false, input, memory(), net );
 	} else if( firstStride == 1 ) {
 		toSum = input;
 	}
 
-	return addConv( dnn, blockName + "conv3", false, dnnlEngine, convOutput, toSum, fwd, fwdArgs );
+	return addConv( dnn, blockName + "conv3", false, convOutput, toSum, net );
 }
 
-static memory addMeanPooling( CDnn& dnn, const CString& poolName, engine& dnnlEngine, memory& input,
-	std::vector<primitive>& fwd, std::vector<std::unordered_map<int, memory>>& fwdArgs )
+static memory addMeanPooling( CDnn& dnn, const CString& poolName, memory& input, CDnnlNet& net )
 {
 	assert( dnn.HasLayer( poolName ) );
 	CMeanPoolingLayer& pool = *dynamic_cast<CMeanPoolingLayer*>( dnn.GetLayer( poolName ).Ptr() );
@@ -330,16 +363,14 @@ static memory addMeanPooling( CDnn& dnn, const CString& poolName, engine& dnnlEn
 		{ pool.GetStrideHeight(), pool.GetStrideWidth() }, { pool.GetFilterHeight(), pool.GetFilterWidth() },
 		{ 0, 0 }, { 0, 0 } );
 
-	pooling_forward::primitive_desc poolPd( poolDesc, dnnlEngine );
+	pooling_forward::primitive_desc poolPd( poolDesc, net.Engine() );
 
-	memory dstMemory( poolPd.dst_desc(), dnnlEngine );
-	fwd.push_back( pooling_forward( poolPd ) );
-	fwdArgs.push_back( { { DNNL_ARG_SRC, input }, { DNNL_ARG_DST, dstMemory } } );
+	memory dstMemory( poolPd.dst_desc(), net.Engine() );
+	net.AddPrimitive( pooling_forward( poolPd ), { { DNNL_ARG_SRC, input }, { DNNL_ARG_DST, dstMemory } } );
 	return dstMemory;
 }
 
-static memory addFc( CDnn& dnn, const CString& fcName, engine& dnnlEngine, memory& input,
-	std::vector<primitive>& fwd, std::vector<std::unordered_map<int, memory>>& fwdArgs )
+static memory addFc( CDnn& dnn, const CString& fcName, memory& input, CDnnlNet& net )
 {
 	assert( dnn.HasLayer( fcName ) );
 	CFullyConnectedLayer& fc = *dynamic_cast<CFullyConnectedLayer*>( dnn.GetLayer( fcName ).Ptr() );
@@ -349,35 +380,34 @@ static memory addFc( CDnn& dnn, const CString& fcName, engine& dnnlEngine, memor
 	memory::desc weightMd( { fc.GetNumberOfElements(), srcDim[1], 1, 1 }, memory::data_type::f32, memory::format_tag::any );
 	memory::desc dstMd( { srcDim[0], fc.GetNumberOfElements() }, memory::data_type::f32, memory::format_tag::any );
 
-	memory weightMemory( { { fc.GetNumberOfElements(), srcDim[1], 1, 1 }, memory::data_type::f32, memory::format_tag::nchw }, dnnlEngine );
+	memory weightMemory( { { fc.GetNumberOfElements(), srcDim[1], 1, 1 }, memory::data_type::f32, memory::format_tag::nchw }, net.Engine() );
 	copyToDnnlMemory( *fc.GetWeightsData(), weightMemory );
 
 	if( fc.IsZeroFreeTerm() ) {
-		inner_product_forward::primitive_desc ipPd( { prop_kind::forward_inference, srcMd, weightMd, dstMd }, dnnlEngine );
-		memory srcMemory = reorderIfNeeded( input, ipPd.src_desc(), fwd, fwdArgs, dnnlEngine );
-		weightMemory = reorderIfNeeded( weightMemory, ipPd.weights_desc(), fwd, fwdArgs, dnnlEngine );
-		memory dstMemory( ipPd.dst_desc(), dnnlEngine );
-		fwd.push_back( inner_product_forward( ipPd ) );
-		fwdArgs.push_back( { { DNNL_ARG_SRC, srcMemory }, { DNNL_ARG_WEIGHTS, weightMemory }, { DNNL_ARG_DST, dstMemory } } );
+		inner_product_forward::primitive_desc ipPd( { prop_kind::forward_inference, srcMd, weightMd, dstMd }, net.Engine() );
+		memory srcMemory = reorderIfNeeded( input, ipPd.src_desc(), net );
+		weightMemory = reorderIfNeeded( weightMemory, ipPd.weights_desc(), net );
+		memory dstMemory( ipPd.dst_desc(), net.Engine() );
+		net.AddPrimitive( inner_product_forward( ipPd ),
+			{ { DNNL_ARG_SRC, srcMemory }, { DNNL_ARG_WEIGHTS, weightMemory }, { DNNL_ARG_DST, dstMemory } } );
 		return dstMemory;
 	}
 
 	memory::desc biasMd( { fc.GetNumberOfElements() }, memory::data_type::f32, memory::format_tag::any );
-	memory biasMemory( { { fc.GetNumberOfElements() }, memory::data_type::f32, memory::format_tag::x }, dnnlEngine );
+	memory biasMemory( { { fc.GetNumberOfElements() }, memory::data_type::f32, memory::format_tag::x }, net.Engine() );
 	copyToDnnlMemory( *fc.GetFreeTermData(), biasMemory );
 
-	inner_product_forward::primitive_desc ipPd( { prop_kind::forward_inference, srcMd, weightMd, biasMd, dstMd }, dnnlEngine );
-	memory srcMemory = reorderIfNeeded( input, ipPd.src_desc(), fwd, fwdArgs, dnnlEngine );
-	weightMemory = reorderIfNeeded( weightMemory, ipPd.weights_desc(), fwd, fwdArgs, dnnlEngine );
-	biasMemory = reorderIfNeeded( biasMemory, ipPd.bias_desc(), fwd, fwdArgs, dnnlEngine );
-	memory dstMemory( ipPd.dst_desc(), dnnlEngine );
-	fwd.push_back( inner_product_forward( ipPd ) );
-	fwdArgs.push_back( { { DNNL_ARG_SRC, srcMemory }, { DNNL_ARG_WEIGHTS, weightMemory }, { DNNL_ARG_BIAS, biasMemory }, { DNNL_ARG_DST, dstMemory } } );
+	inner_product_forward::primitive_desc ipPd( { prop_kind::forward_inference, srcMd, weightMd, biasMd, dstMd }, net.Engine() );
+	memory srcMemory = reorderIfNeeded( input, ipPd.src_desc(), net );
+	weightMemory = reorderIfNeeded( weightMemory, ipPd.weights_desc(), net );
+	biasMemory = reorderIfNeeded( biasMemory, ipPd.bias_desc(), net );
+	memory dstMemory( ipPd.dst_desc(), net.Engine() );
+	net.AddPrimitive( inner_product_forward( ipPd ),
+		{ { DNNL_ARG_SRC, srcMemory }, { DNNL_ARG_WEIGHTS, weightMemory }, { DNNL_ARG_BIAS, biasMemory }, { DNNL_ARG_DST, dstMemory } } );
 	return dstMemory;
 }
 
-static memory convertOutput( memory& currOutput, std::vector<primitive>& fwd,
-	std::vector<std::unordered_map<int, memory>>& fwdArgs, engine& dnnlEngine )
+static memory convertOutput( memory& currOutput, CDnnlNet& net )
 {
 	memory::dims outDims( currOutput.get_desc().dims() );
 	memory::format_tag preferredFormat;
@@ -395,7 +425,7 @@ static memory convertOutput( memory& currOutput, std::vector<primitive>& fwd,
 		assert( false );
 	}
 	memory::desc preferredOutputDesc( outDims, memory::data_type::f32, preferredFormat );
-	return reorderIfNeeded( currOutput, preferredOutputDesc, fwd, fwdArgs, dnnlEngine );
+	return reorderIfNeeded( currOutput, preferredOutputDesc, net );
 }
 
 static void loadDnn( CDnn& dnn, const CString& netName )
@@ -425,7 +455,7 @@ int main( int argc, char** argv )
 	const CString inputName = "in";
 	const size_t runCount = 100;
 	const int imageSizeMultiplier = 16;
-	engine::kind engineKind = engine::kind::gpu;
+	engine::kind engineKind = engine::kind::cpu;
 
 	std::unique_ptr<IMathEngine> mathEngine;
 	if( engineKind == engine::kind::cpu ) {
@@ -449,8 +479,7 @@ int main( int argc, char** argv )
 		return 1;
 	}
 
-	engine dnnlEngine( engineKind, 0 );
-	stream dnnlStream( dnnlEngine );
+	CDnnlNet net( engineKind );
 
 	CRandom random( 0x54 );
 	CDnn dnn( random, *mathEngine );
@@ -470,43 +499,39 @@ int main( int argc, char** argv )
 		pool->SetFilterHeight( pool->GetFilterHeight() * imageSizeMultiplier );
 		pool->SetFilterWidth( pool->GetFilterWidth() * imageSizeMultiplier );
 	}
+
 	memory input( { { inputBlob->GetObjectCount(), inputBlob->GetChannelsCount(), inputBlob->GetHeight(), inputBlob->GetWidth() },
-		memory::data_type::f32, memory::format_tag::nchw }, dnnlEngine );
+		memory::data_type::f32, memory::format_tag::nchw }, net.Engine() );
 	copyToDnnlMemory( *inputBlob, input );
 
-	std::vector<primitive> fwd;
-	std::vector<std::unordered_map<int, memory>> fwdArgs;
-	memory output = addConv( dnn, "conv1", true, dnnlEngine, input, fwd, fwdArgs );
-	output = addBlock( dnn, "block0", dnnlEngine, output, fwd, fwdArgs );
-	output = addBlock( dnn, "block10", dnnlEngine, output, fwd, fwdArgs );
-	output = addBlock( dnn, "block11", dnnlEngine, output, fwd, fwdArgs );
-	output = addBlock( dnn, "block20", dnnlEngine, output, fwd, fwdArgs );
-	output = addBlock( dnn, "block21", dnnlEngine, output, fwd, fwdArgs );
-	output = addBlock( dnn, "block22", dnnlEngine, output, fwd, fwdArgs );
-	output = addBlock( dnn, "block30", dnnlEngine, output, fwd, fwdArgs );
-	output = addBlock( dnn, "block31", dnnlEngine, output, fwd, fwdArgs );
-	output = addBlock( dnn, "block32", dnnlEngine, output, fwd, fwdArgs );
-	output = addBlock( dnn, "block33", dnnlEngine, output, fwd, fwdArgs );
-	output = addBlock( dnn, "block40", dnnlEngine, output, fwd, fwdArgs );
-	output = addBlock( dnn, "block41", dnnlEngine, output, fwd, fwdArgs );
-	output = addBlock( dnn, "block42", dnnlEngine, output, fwd, fwdArgs );
-	output = addBlock( dnn, "block50", dnnlEngine, output, fwd, fwdArgs );
-	output = addBlock( dnn, "block51", dnnlEngine, output, fwd, fwdArgs );
-	output = addBlock( dnn, "block52", dnnlEngine, output, fwd, fwdArgs );
-	output = addBlock( dnn, "block6", dnnlEngine, output, fwd, fwdArgs );
-	output = addConv( dnn, "conv2", true, dnnlEngine, output, fwd, fwdArgs );
-	output = addMeanPooling( dnn, "pool", dnnlEngine, output, fwd, fwdArgs );
-	output = addFc( dnn, "fc", dnnlEngine, output, fwd, fwdArgs );
-	output = convertOutput( output, fwd, fwdArgs, dnnlEngine );
+	memory output = addConv( dnn, "conv1", true, input, net );
+	output = addBlock( dnn, "block0", output, net );
+	output = addBlock( dnn, "block10", output, net );
+	output = addBlock( dnn, "block11", output, net );
+	output = addBlock( dnn, "block20", output, net );
+	output = addBlock( dnn, "block21", output, net );
+	output = addBlock( dnn, "block22", output, net );
+	output = addBlock( dnn, "block30", output, net );
+	output = addBlock( dnn, "block31", output, net );
+	output = addBlock( dnn, "block32", output, net );
+	output = addBlock( dnn, "block33", output, net );
+	output = addBlock( dnn, "block40", output, net );
+	output = addBlock( dnn, "block41", output, net );
+	output = addBlock( dnn, "block42", output, net );
+	output = addBlock( dnn, "block50", output, net );
+	output = addBlock( dnn, "block51", output, net );
+	output = addBlock( dnn, "block52", output, net );
+	output = addBlock( dnn, "block6", output, net );
+	output = addConv( dnn, "conv2", true, output, net );
+	output = addMeanPooling( dnn, "pool", output, net );
+	output = addFc( dnn, "fc", output, net );
+	output = convertOutput( output, net );
 
 	const size_t outputBytes = output.get_desc().get_size();
 	assert( outputBytes % sizeof( float ) == 0 );
 	std::vector<float> actual( outputBytes / sizeof( float ) );
 
-	for( size_t i = 0; i < fwd.size(); ++i ) {
-		fwd.at( i ).execute( dnnlStream, fwdArgs.at( i ) );
-	}
-	dnnlStream.wait();
+	net.Execute();
 	copyFromDnnlMemory( output, actual );
 
 	{
@@ -514,10 +539,7 @@ int main( int argc, char** argv )
 		counters->Synchronise();
 
 		for( size_t run = 1; run <= runCount; ++run ) {
-			for( size_t i = 0; i < fwd.size(); ++i ) {
-				fwd.at( i ).execute( dnnlStream, fwdArgs.at( i ) );
-			}
-			dnnlStream.wait();
+			net.Execute();
 			copyFromDnnlMemory( output, actual );
 		}
 
