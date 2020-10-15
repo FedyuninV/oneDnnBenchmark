@@ -467,11 +467,11 @@ static memory buildDnnlNet( const CDnn& dnn, memory& input, CDnnlNet& net )
 static void adaptPoolSize( size_t originalSize, size_t actualSize, CDnn& dnn, const CString& poolName )
 {
 	assert( actualSize % originalSize == 0 );
-	const int maltiplier = actualSize / originalSize;
-	if( maltiplier != 1 ) {
+	const size_t multiplier = actualSize / originalSize;
+	if( multiplier != 1 ) {
 		CPtr<CPoolingLayer> pool = CheckCast<CPoolingLayer>( dnn.GetLayer( poolName ) );
-		pool->SetFilterHeight( pool->GetFilterHeight() * maltiplier );
-		pool->SetFilterWidth( pool->GetFilterWidth() * maltiplier );
+		pool->SetFilterHeight( static_cast<int>( pool->GetFilterHeight() * multiplier ) );
+		pool->SetFilterWidth( static_cast<int>( pool->GetFilterWidth() * multiplier ) );
 	}
 }
 
@@ -506,6 +506,35 @@ static IMathEngine* createMathEngine( engine::kind engineKind )
 	return nullptr;
 }
 
+class CTestTimer {
+public:
+	CTestTimer( const std::string& header, IMathEngine& mathEngine );
+	~CTestTimer();
+
+private:
+	std::string header;
+	std::unique_ptr<IPerformanceCounters> counters;
+};
+
+CTestTimer::CTestTimer( const std::string& header, IMathEngine& mathEngine ) :
+	header( header ), counters( mathEngine.CreatePerformanceCounters() )
+{
+	counters->Synchronise(); 
+}
+
+CTestTimer::~CTestTimer()
+{
+	try {
+		counters->Synchronise(); 
+		std::cout << header << std::endl;
+		for( const auto& counter : *counters ) {
+			std::cout << counter.Name << ": " << counter.Value << std::endl;
+		}
+		std::cout << std::endl;
+	} catch( std::exception& ) {
+	}
+}
+
 static std::vector<float> testDnnl( engine::kind engineKind, const CDnn& dnn, const CDnnBlob& inputBlob, size_t runCount )
 {
 	CDnnlNet net( engineKind );
@@ -524,20 +553,12 @@ static std::vector<float> testDnnl( engine::kind engineKind, const CDnn& dnn, co
 
 	std::vector<float> buff( result.size() );
 	{
-		auto counters = dnn.GetMathEngine().CreatePerformanceCounters();
-		counters->Synchronise();
+		CTestTimer timer( "*** ONE DNN ***", dnn.GetMathEngine() );
 
 		for( size_t run = 1; run <= runCount; ++run ) {
 			net.Execute();
 			copyFromDnnlMemory( output, buff );
 		}
-		
-		counters->Synchronise();
-		std::cout << "*** ONE DNN ***" << std::endl;
-		for( const auto& counter : *counters ) {
-			std::cout << counter.Name << ": " << counter.Value << std::endl;
-		}
-		std::cout << std::endl;
 	}
 
 	return result;
@@ -559,22 +580,24 @@ static std::vector<float> testNeoML( CDnn& dnn, CDnnBlob& inputBlob, const CStri
 
 	std::vector<float> buff( outputBlob->GetDataSize() );
 	{
-		auto counters = dnn.GetMathEngine().CreatePerformanceCounters();
-		counters->Synchronise();
+		CTestTimer timer( "***  NeoML  ***", dnn.GetMathEngine() );
 
 		for( size_t run = 1; run <= runCount; ++run ) {
 			dnn.RunOnce();
 			out->GetBlob()->CopyTo( buff.data() );
 		}
-
-		counters->Synchronise();
-		std::cout << "***  NeoML  ***" << std::endl;
-		for( const auto& counter : *counters ) {
-			std::cout << counter.Name << ": " << counter.Value << std::endl;
-		}
-		std::cout << std::endl;
 	}
 
+	return result;
+}
+
+static float maxAbsError( const std::vector<float>& first, const std::vector<float>& second )
+{
+	assert( expected.size() == actual.size() );
+	float result = 0;
+	for( size_t i = 0; i < first.size(); ++i ) {
+		result = max( result, fabsf( first[i] - second[i] ) );
+	}
 	return result;
 }
 
@@ -582,9 +605,9 @@ int main( int argc, char** argv )
 {
 	try {
 		const CString netName = "MobileNetV2Cifar10";
-		const size_t runCount = 100;
-		const int imageSize = 512;
-		engine::kind engineKind = engine::kind::cpu;
+		const size_t runCount = 1000;
+		const int imageSize = 128;
+		engine::kind engineKind = engine::kind::gpu;
 
 		std::unique_ptr<IMathEngine> mathEngine( createMathEngine( engineKind ) );
 		if( mathEngine == nullptr ) {
@@ -603,13 +626,7 @@ int main( int argc, char** argv )
 		std::vector<float> actual = testDnnl( engineKind, dnn, *inputBlob, runCount );
 		std::vector<float> expected = testNeoML( dnn, *inputBlob, "in", "out", runCount );
 
-		float maxAbsErr = 0;
-		assert( expected.size() == actual.size() );
-		for( size_t i = 0; i < expected.size(); ++i ) {
-			maxAbsErr = max( maxAbsErr, fabsf( expected[i] - actual[i] ) );
-		}
-
-		std::cout << "Max abs err: " << maxAbsErr << std::endl;
+		std::cout << "Max abs err: " << maxAbsError( expected, actual ) << std::endl;
 	} catch( std::exception& ex ) {
 		std::cerr << "Exception: " << ex.what() << std::endl;
 		return 1;
