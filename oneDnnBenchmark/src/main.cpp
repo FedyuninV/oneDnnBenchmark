@@ -3,10 +3,13 @@
 #include <memory>
 #include <iostream>
 #include <vector>
+#include <algorithm>
+#include <numeric>
 
 using namespace dnnl;
 
 typedef std::unordered_map<int, memory> primitiveArg;
+typedef IPerformanceCounters::CCounter::TCounterType TTimerType;
 
 class CDnnlNet {
 public:
@@ -18,16 +21,25 @@ public:
 	primitive& LastPrimitive() { assert( !primitives.empty() ); return primitives.back(); }
 	primitiveArg& LastArg() { assert( !args.empty() ); return args.back(); }
 
-	void AddPrimitive( const primitive& p, const primitiveArg& arg ) { primitives.push_back( p ); args.push_back( arg ); }
-	void AddPrimitive( primitive&& p, primitiveArg&& arg ) { primitives.push_back( p ); args.push_back( arg ); }
+	void AddPrimitive( const primitive& p, const primitiveArg& arg, const std::string& name )
+		{ primitives.push_back( p ); args.push_back( arg ); names.push_back( name ); }
+	void AddPrimitive( primitive&& p, primitiveArg&& arg, std::string&& name )
+		{ primitives.push_back( p ); args.push_back( arg ); names.push_back( name ); }
 
 	void Execute();
+	void Profile( IMathEngine& mathEngine );
+
+	const std::vector<std::string>& PrimitiveNames() const { return names; }
+	TTimerType PrimitiveTime( const std::string& name )
+		{ assert( times.find( name ) != times.end() ); return times[name]; }
 
 private:
 	engine dnnlEngine;
 	stream dnnlStream;
 	std::vector<primitive> primitives;
 	std::vector<primitiveArg> args;
+	std::vector<std::string> names;
+	std::unordered_map<std::string, TTimerType> times;
 };
 
 CDnnlNet::CDnnlNet( engine::kind kind ) :
@@ -45,11 +57,24 @@ void CDnnlNet::Execute()
 	dnnlStream.wait();
 }
 
+void CDnnlNet::Profile( IMathEngine& mathEngine )
+{
+	assert( primitives.size() == args.size() );
+	assert( dnnlEngine.get_kind() == engine::kind::cpu );
+
+	std::unique_ptr<IPerformanceCounters> counters( mathEngine.CreatePerformanceCounters() );
+	for( size_t i = 0; i < primitives.size(); ++i ) {
+		counters->Synchronise();
+		primitives[i].execute( dnnlStream, args[i] );
+		dnnlStream.wait();
+		counters->Synchronise();
+		times[names[i]] += ( *counters )[0].Value;
+	}
+}
+
 static int convOutputSize( int inputSize, int filterSize, int stride, int padding, int dilation )
 {
-	assert( dilation == 1 );
-	( void ) dilation;
-	return ( inputSize + 2 * padding - filterSize ) / stride + 1;
+	return ( inputSize + 2 * padding - ( ( filterSize - 1 ) * dilation + 1 ) ) / stride + 1;
 }
 
 static void repackToChannelFirst( const CBlobDesc& desc, const float* hwc, float* chw )
@@ -139,41 +164,41 @@ static memory::desc noFormat( const memory& mem )
 	return noFormat( mem.get_desc() );
 }
 
-static memory reorderIfNeeded( const memory& src, const memory::desc& dstDesc, CDnnlNet& net )
+static memory reorderIfNeeded( const memory& src, const memory::desc& dstDesc, const std::string& baseName, CDnnlNet& net )
 {
 	if( src.get_desc() == dstDesc ) {
 		return src;
 	}
 
 	memory result( dstDesc, net.Engine() );
-	net.AddPrimitive( reorder( src, result ), { { DNNL_ARG_FROM, src }, { DNNL_ARG_TO, result } } );
+	net.AddPrimitive( reorder( src, result ), { { DNNL_ARG_FROM, src }, { DNNL_ARG_TO, result } }, baseName + "Reorder" );
 	return result;
 }
 
 static convolution_forward::desc buildConvDesc( const CBaseConvLayer& conv, const memory& input, engine& dnnlEngine, memory::dims dstDim )
 {
 	CPtr<CDnnBlob> filter = conv.GetFilterData();
-	const bool isChannelwise = dynamic_cast<const CChannelwiseConvLayer*>( &conv ) != nullptr;
+	const bool isChannelwise = dynamic_cast< const CChannelwiseConvLayer* >( &conv ) != nullptr;
 
 	memory::desc srcMd( noFormat( input ) );
 	memory::dims weightDim;
 	if( isChannelwise ) {
-		weightDim = { static_cast<memory::dim>( filter->GetObjectCount() ) * filter->GetChannelsCount(), 1, 1, filter->GetHeight(), filter->GetWidth() };
+		weightDim = { static_cast< memory::dim >( filter->GetObjectCount() ) * filter->GetChannelsCount(), 1, 1, filter->GetHeight(), filter->GetWidth() };
 	} else {
 		weightDim = { filter->GetObjectCount(), filter->GetChannelsCount(), filter->GetHeight(), filter->GetWidth() };
 	}
 	memory::desc weightMd( weightDim, memory::data_type::f32, memory::format_tag::any );
 	memory::desc biasMd;
 	memory::desc dstMd( dstDim, memory::data_type::f32, memory::format_tag::any );
-	
+
 	if( !conv.IsZeroFreeTerm() ) {
 		biasMd = memory::desc( { conv.GetFilterCount() }, memory::data_type::f32, memory::format_tag::any );
 	}
 
 	// TODO: test with direct instead of auto
 	return convolution_forward::desc( prop_kind::forward_inference, algorithm::convolution_auto,
-		srcMd, weightMd, biasMd, dstMd,
-		{ conv.GetStrideHeight(), conv.GetStrideWidth() }, { conv.GetPaddingHeight(), conv.GetPaddingWidth() },
+		srcMd, weightMd, biasMd, dstMd, { conv.GetStrideHeight(), conv.GetStrideWidth() },
+		{ conv.GetDilationHeight() - 1, conv.GetDilationWidth() - 1 }, { conv.GetPaddingHeight(), conv.GetPaddingWidth() },
 		{ conv.GetPaddingHeight(), conv.GetPaddingWidth() } );
 }
 
@@ -241,58 +266,64 @@ static memory addConv( const CDnn& dnn, const CString& convName, const CString& 
 		conv.GetPaddingWidth(), conv.GetDilationWidth() );
 
 	convolution_forward::desc convDesc = buildConvDesc( conv, input, net.Engine(), dstDims );
+	std::string primitiveName = convName;
 
 	// Add post-ops if needed
 	dnnl::post_ops convPo;
 	if( addReLU ) {
 		convPo.append_eltwise( 1.f, algorithm::eltwise_relu, 0.f, 0.f );
+		primitiveName += "Relu";
 	}
 	if( channelwiseOp != nullptr ) {
 		if( channelwiseOp->GetStrideHeight() == 1 ) {
+			primitiveName += "Dws1";
 			convPo.append_dw_k3s1p1( memory::data_type::f32,
 				channelwiseOp->IsZeroFreeTerm() ? memory::data_type::undef : memory::data_type::f32,
 				memory::data_type::f32, 0, { 1.f } );
 		} else {
+			primitiveName += "Dws2";
 			convPo.append_dw_k3s2p1( memory::data_type::f32,
 				channelwiseOp->IsZeroFreeTerm() ? memory::data_type::undef : memory::data_type::f32,
 				memory::data_type::f32, 0, { 1.f } );
 		}
 		if( addReLU ) {
 			convPo.append_eltwise( 1.f, algorithm::eltwise_relu, 0.f, 0.f );
+			primitiveName += "Relu";
 		}
 	}
 	if( toAdd != memory() ) {
 		convPo.append_sum();
+		primitiveName += "Sum";
 	}
 
 	primitive_attr convPa;
 	convPa.set_post_ops( convPo );
 	convolution_forward::primitive_desc convPd( convDesc, convPa, net.Engine() );
 
-	memory srcMemory = reorderIfNeeded( input, convPd.src_desc(), net );
-	memory weightMemory = reorderIfNeeded( convFilter( conv, net.Engine() ), convPd.weights_desc(), net );
+	memory srcMemory = reorderIfNeeded( input, convPd.src_desc(), convName + "Src", net );
+	memory weightMemory = reorderIfNeeded( convFilter( conv, net.Engine() ), convPd.weights_desc(), convName + "Weight", net );
 	memory biasMemory;
 	memory dstMemory = toAdd == memory() ? memory( convPd.dst_desc(), net.Engine() )
-		: reorderIfNeeded( toAdd, convPd.dst_desc(), net );
+		: reorderIfNeeded( toAdd, convPd.dst_desc(), convName + "Dst", net );
 	if( !conv.IsZeroFreeTerm() ) {
-		biasMemory = reorderIfNeeded( convBias( conv, net.Engine() ), convPd.bias_desc(), net );
+		biasMemory = reorderIfNeeded( convBias( conv, net.Engine() ), convPd.bias_desc(), convName + "Bias", net );
 	}
 
 	memory dwWeightMemory;
 	memory dwBiasMemory;
 	if( channelwiseOp != nullptr ) {
 		memory::desc dwWeightMd = convPd.query_md( query::exec_arg_md, DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_WEIGHTS );
-		dwWeightMemory = reorderIfNeeded( convFilter( *channelwiseOp, net.Engine() ), dwWeightMd, net );
+		dwWeightMemory = reorderIfNeeded( convFilter( *channelwiseOp, net.Engine() ), dwWeightMd, convName + "DwWeight", net );
 		if( !channelwiseOp->IsZeroFreeTerm() ) {
 			memory::desc dwBiasMd = convPd.query_md( query::exec_arg_md, DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_BIAS );
-			dwBiasMemory = reorderIfNeeded( convBias( *channelwiseOp, net.Engine() ), dwBiasMd, net );
+			dwBiasMemory = reorderIfNeeded( convBias( *channelwiseOp, net.Engine() ), dwBiasMd, convName + "DwBias", net );
 		}
 	}
 	
 	net.AddPrimitive( convolution_forward( convPd ),
 		{ { DNNL_ARG_SRC, srcMemory }, { DNNL_ARG_WEIGHTS, weightMemory }, { DNNL_ARG_DST, dstMemory },
 			{ DNNL_ARG_BIAS, biasMemory }, { DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_WEIGHTS, dwWeightMemory },
-			{ DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_BIAS, dwBiasMemory } } );
+			{ DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_BIAS, dwBiasMemory } }, primitiveName );
 
 	return dstMemory;
 }
@@ -329,7 +360,8 @@ static memory addBlock( const CDnn& dnn, const CString& blockName, memory& input
 		&& ( conv2->GetStrideWidth() == 1 || conv2->GetStrideWidth() == 2 )
 		&& conv2->GetPaddingHeight() == 1 && conv2->GetPaddingWidth() == 1
 		&& conv2->GetDilationHeight() == 1 && conv2->GetDilationWidth() == 1
-		&& conv2->GetFilterHeight() == 3 && conv2->GetFilterWidth() == 3 )
+		&& conv2->GetFilterHeight() == 3 && conv2->GetFilterWidth() == 3
+		&& conv1->GetFilterHeight() == 1 && conv1->GetFilterWidth() == 1 )
 	{
 		// Here DwConv is fused with Conv (after fixes)
 		convOutput = addConv( dnn, blockName + "conv1", blockName + "conv2", true, input, net );
@@ -367,7 +399,7 @@ static memory addMeanPooling( const CDnn& dnn, const CString& poolName, memory& 
 	pooling_forward::primitive_desc poolPd( poolDesc, net.Engine() );
 
 	memory dstMemory( poolPd.dst_desc(), net.Engine() );
-	net.AddPrimitive( pooling_forward( poolPd ), { { DNNL_ARG_SRC, input }, { DNNL_ARG_DST, dstMemory } } );
+	net.AddPrimitive( pooling_forward( poolPd ), { { DNNL_ARG_SRC, input }, { DNNL_ARG_DST, dstMemory } }, poolName );
 	return dstMemory;
 }
 
@@ -386,11 +418,11 @@ static memory addFc( const CDnn& dnn, const CString& fcName, memory& input, CDnn
 
 	if( fc.IsZeroFreeTerm() ) {
 		inner_product_forward::primitive_desc ipPd( { prop_kind::forward_inference, srcMd, weightMd, dstMd }, net.Engine() );
-		memory srcMemory = reorderIfNeeded( input, ipPd.src_desc(), net );
-		weightMemory = reorderIfNeeded( weightMemory, ipPd.weights_desc(), net );
+		memory srcMemory = reorderIfNeeded( input, ipPd.src_desc(), fcName + "Src", net );
+		weightMemory = reorderIfNeeded( weightMemory, ipPd.weights_desc(), fcName + "Weight", net );
 		memory dstMemory( ipPd.dst_desc(), net.Engine() );
 		net.AddPrimitive( inner_product_forward( ipPd ),
-			{ { DNNL_ARG_SRC, srcMemory }, { DNNL_ARG_WEIGHTS, weightMemory }, { DNNL_ARG_DST, dstMemory } } );
+			{ { DNNL_ARG_SRC, srcMemory }, { DNNL_ARG_WEIGHTS, weightMemory }, { DNNL_ARG_DST, dstMemory } }, fcName );
 		return dstMemory;
 	}
 
@@ -399,16 +431,17 @@ static memory addFc( const CDnn& dnn, const CString& fcName, memory& input, CDnn
 	copyToDnnlMemory( *fc.GetFreeTermData(), biasMemory );
 
 	inner_product_forward::primitive_desc ipPd( { prop_kind::forward_inference, srcMd, weightMd, biasMd, dstMd }, net.Engine() );
-	memory srcMemory = reorderIfNeeded( input, ipPd.src_desc(), net );
-	weightMemory = reorderIfNeeded( weightMemory, ipPd.weights_desc(), net );
-	biasMemory = reorderIfNeeded( biasMemory, ipPd.bias_desc(), net );
+	memory srcMemory = reorderIfNeeded( input, ipPd.src_desc(), fcName + "Src", net );
+	weightMemory = reorderIfNeeded( weightMemory, ipPd.weights_desc(), fcName + "Weight", net );
+	biasMemory = reorderIfNeeded( biasMemory, ipPd.bias_desc(), fcName + "Bias", net );
 	memory dstMemory( ipPd.dst_desc(), net.Engine() );
 	net.AddPrimitive( inner_product_forward( ipPd ),
-		{ { DNNL_ARG_SRC, srcMemory }, { DNNL_ARG_WEIGHTS, weightMemory }, { DNNL_ARG_BIAS, biasMemory }, { DNNL_ARG_DST, dstMemory } } );
+		{ { DNNL_ARG_SRC, srcMemory }, { DNNL_ARG_WEIGHTS, weightMemory }, { DNNL_ARG_BIAS, biasMemory }, { DNNL_ARG_DST, dstMemory } },
+		fcName );
 	return dstMemory;
 }
 
-static memory convertOutput( memory& currOutput, CDnnlNet& net )
+static memory convertOutput( memory& currOutput, const std::string& name, CDnnlNet& net )
 {
 	memory::dims outDims( currOutput.get_desc().dims() );
 	memory::format_tag preferredFormat;
@@ -426,7 +459,7 @@ static memory convertOutput( memory& currOutput, CDnnlNet& net )
 		assert( false );
 	}
 	memory::desc preferredOutputDesc( outDims, memory::data_type::f32, preferredFormat );
-	return reorderIfNeeded( currOutput, preferredOutputDesc, net );
+	return reorderIfNeeded( currOutput, preferredOutputDesc, name, net );
 }
 
 static void loadDnn( CDnn& dnn, const CString& netName )
@@ -461,10 +494,10 @@ static memory buildDnnlNet( const CDnn& dnn, memory& input, CDnnlNet& net )
 	output = addConv( dnn, "conv2", true, output, net );
 	output = addMeanPooling( dnn, "pool", output, net );
 	output = addFc( dnn, "fc", output, net );
-	return convertOutput( output, net );
+	return convertOutput( output, "out", net );
 }
 
-static void adaptPoolSize( size_t originalSize, size_t actualSize, CDnn& dnn, const CString& poolName )
+static void adaptPoolSize( size_t originalSize, size_t actualSize, const CString& poolName, CDnn& dnn )
 {
 	assert( actualSize % originalSize == 0 );
 	const size_t multiplier = actualSize / originalSize;
@@ -475,9 +508,9 @@ static void adaptPoolSize( size_t originalSize, size_t actualSize, CDnn& dnn, co
 	}
 }
 
-static CDnnBlob* createInputBlob( IMathEngine& mathEngine, CRandom& random, const int imageSize )
+static CDnnBlob* createInputBlob( IMathEngine& mathEngine, CRandom& random, const int imageSize, const int channelsCount )
 {
-	CDnnBlob* blob = CDnnBlob::Create2DImageBlob( mathEngine, CT_Float, 1, 1, imageSize, imageSize, 3 );
+	CDnnBlob* blob = CDnnBlob::Create2DImageBlob( mathEngine, CT_Float, 1, 1, imageSize, imageSize, channelsCount );
 	float* buff = blob->GetBuffer<float>( 0, blob->GetDataSize() );
 	for( int i = 0; i < blob->GetDataSize(); ++i ) {
 		buff[i] = static_cast<float>( random.Uniform( -1, 2 ) );
@@ -535,7 +568,7 @@ CTestTimer::~CTestTimer()
 	}
 }
 
-static std::vector<float> testDnnl( engine::kind engineKind, const CDnn& dnn, const CDnnBlob& inputBlob, size_t runCount )
+static std::vector<float> testDnnl( engine::kind engineKind, const CDnn& dnn, const CDnnBlob& inputBlob, size_t runCount, IMathEngine& mathEngine )
 {
 	CDnnlNet net( engineKind );
 	memory input( { { inputBlob.GetObjectCount(), inputBlob.GetChannelsCount(), inputBlob.GetHeight(), inputBlob.GetWidth() },
@@ -554,11 +587,27 @@ static std::vector<float> testDnnl( engine::kind engineKind, const CDnn& dnn, co
 	std::vector<float> buff( result.size() );
 	{
 		CTestTimer timer( "*** ONE DNN ***", dnn.GetMathEngine() );
-
 		for( size_t run = 1; run <= runCount; ++run ) {
-			net.Execute();
+			engineKind == engine::kind::cpu ? net.Profile( mathEngine ) : net.Execute();
 			copyFromDnnlMemory( output, buff );
 		}
+	}
+
+	if( engineKind == engine::kind::cpu ) {
+		const std::vector<std::string> primitives = net.PrimitiveNames();
+		std::vector<TTimerType> times;
+		std::transform( primitives.begin(), primitives.end(), std::back_inserter( times ),
+			[&net] ( const std::string& name ) { return net.PrimitiveTime( name ); } );
+		TTimerType total = std::accumulate( times.begin(), times.end(), 0 );
+		::printf( "\nPerf stats:\n" );
+		for( size_t i = 0; i < primitives.size(); ++i ) {
+			if( times[i] == 0 ) {
+				continue;
+			}
+			::printf( "%3d:%s\t%d\t(%f%%)\n", static_cast<int>( i ), primitives[i].data(),
+				static_cast<int>( times[i] ), static_cast<float>( times[i] * 100. / total ) );
+		}
+		::printf( "\n" );
 	}
 
 	return result;
@@ -581,11 +630,29 @@ static std::vector<float> testNeoML( CDnn& dnn, CDnnBlob& inputBlob, const CStri
 	std::vector<float> buff( outputBlob->GetDataSize() );
 	{
 		CTestTimer timer( "***  NeoML  ***", dnn.GetMathEngine() );
-
 		for( size_t run = 1; run <= runCount; ++run ) {
 			dnn.RunOnce();
 			out->GetBlob()->CopyTo( buff.data() );
 		}
+	}
+
+	if( dnn.GetMathEngine().GetType() == MET_Cpu ) {
+		CArray<const char*> names;
+		dnn.GetLayerList( names );
+		std::vector<TTimerType> times;
+		for( int i = 0; i < names.Size(); ++i ) {
+			times.push_back( dnn.GetLayer( names[i] )->GetRunOnceTime() );
+		}
+		TTimerType total = std::accumulate( times.begin(), times.end(), 0 );
+		::printf( "\nPerf stats:\n" );
+		for( int i = 0; i < names.Size(); ++i ) {
+			if( times[i] == 0 ) {
+				continue;
+			}
+			::printf( "%3d:%s\t%d\t(%f%%)\n", static_cast<int>( i ), names[i],
+				static_cast<int>( times[i] ), static_cast<float>( times[i] * 100. / total ) );
+		}
+		::printf( "\n" );
 	}
 
 	return result;
@@ -593,7 +660,7 @@ static std::vector<float> testNeoML( CDnn& dnn, CDnnBlob& inputBlob, const CStri
 
 static float maxAbsError( const std::vector<float>& first, const std::vector<float>& second )
 {
-	assert( expected.size() == actual.size() );
+	assert( first.size() == second.size() );
 	float result = 0;
 	for( size_t i = 0; i < first.size(); ++i ) {
 		result = max( result, fabsf( first[i] - second[i] ) );
@@ -605,9 +672,10 @@ int main( int argc, char** argv )
 {
 	try {
 		const CString netName = "MobileNetV2Cifar10";
-		const size_t runCount = 1000;
-		const int imageSize = 128;
-		engine::kind engineKind = engine::kind::gpu;
+		const size_t runCount = 100;
+		const int imageSize = 512;
+		const int imageChannels = 3;
+		engine::kind engineKind = engine::kind::cpu;
 
 		std::unique_ptr<IMathEngine> mathEngine( createMathEngine( engineKind ) );
 		if( mathEngine == nullptr ) {
@@ -620,10 +688,10 @@ int main( int argc, char** argv )
 
 		loadDnn( dnn, netName );
 
-		CPtr<CDnnBlob> inputBlob = createInputBlob( *mathEngine, random, imageSize );
-		adaptPoolSize( 32, imageSize, dnn, "pool" );
+		CPtr<CDnnBlob> inputBlob = createInputBlob( *mathEngine, random, imageSize, imageChannels );
+		adaptPoolSize( 32, imageSize, "pool", dnn );
 
-		std::vector<float> actual = testDnnl( engineKind, dnn, *inputBlob, runCount );
+		std::vector<float> actual = testDnnl( engineKind, dnn, *inputBlob, runCount, *mathEngine );
 		std::vector<float> expected = testNeoML( dnn, *inputBlob, "in", "out", runCount );
 
 		std::cout << "Max abs err: " << maxAbsError( expected, actual ) << std::endl;

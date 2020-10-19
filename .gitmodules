@@ -1,7 +1,7 @@
 [submodule "third_party/NeoML"]
 	path = third_party/NeoML
-	url = https://github.com/neoml-lib/NeoML
-	branch = master
+	url = https://github.com/FedyuninV/NeoML
+	branch = RunOnceTimer
 [submodule "third_party/oneDNN"]
 	path = third_party/oneDNN
 	url = https://github.com/oneapi-src/oneDNN
