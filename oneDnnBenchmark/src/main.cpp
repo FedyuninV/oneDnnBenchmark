@@ -304,7 +304,7 @@ static memory addConv( const CDnn& dnn, const CString& convName, const CString& 
 	memory weightMemory = reorderIfNeeded( convFilter( conv, net.Engine() ), convPd.weights_desc(), convName + "Weight", net );
 	memory biasMemory;
 	memory dstMemory = toAdd == memory() ? memory( convPd.dst_desc(), net.Engine() )
-		: reorderIfNeeded( toAdd, convPd.dst_desc(), convName + "Dst", net );
+		: reorderIfNeeded( toAdd, convPd.dst_desc(), convName + "ToAdd", net );
 	if( !conv.IsZeroFreeTerm() ) {
 		biasMemory = reorderIfNeeded( convBias( conv, net.Engine() ), convPd.bias_desc(), convName + "Bias", net );
 	}
@@ -563,7 +563,6 @@ CTestTimer::~CTestTimer()
 		for( const auto& counter : *counters ) {
 			std::cout << counter.Name << ": " << counter.Value << std::endl;
 		}
-		std::cout << std::endl;
 	} catch( std::exception& ) {
 	}
 }
@@ -571,8 +570,9 @@ CTestTimer::~CTestTimer()
 static std::vector<float> testDnnl( engine::kind engineKind, const CDnn& dnn, const CDnnBlob& inputBlob, size_t runCount, IMathEngine& mathEngine )
 {
 	CDnnlNet net( engineKind );
-	memory input( { { inputBlob.GetObjectCount(), inputBlob.GetChannelsCount(), inputBlob.GetHeight(), inputBlob.GetWidth() },
-		memory::data_type::f32, memory::format_tag::nchw }, net.Engine() );
+	memory::desc inputMd( { inputBlob.GetObjectCount(), inputBlob.GetChannelsCount(), inputBlob.GetHeight(), inputBlob.GetWidth() },
+		memory::data_type::f32, memory::format_tag::nchw );
+	memory input( inputMd, net.Engine() );
 	copyToDnnlMemory( inputBlob, input );
 
 	memory output = buildDnnlNet( dnn, input, net );
@@ -599,7 +599,7 @@ static std::vector<float> testDnnl( engine::kind engineKind, const CDnn& dnn, co
 		std::transform( primitives.begin(), primitives.end(), std::back_inserter( times ),
 			[&net] ( const std::string& name ) { return net.PrimitiveTime( name ); } );
 		TTimerType total = std::accumulate( times.begin(), times.end(), 0 );
-		::printf( "\nPerf stats:\n" );
+		::printf( "Perf stats:\n" );
 		for( size_t i = 0; i < primitives.size(); ++i ) {
 			if( times[i] == 0 ) {
 				continue;
@@ -626,6 +626,7 @@ static std::vector<float> testNeoML( CDnn& dnn, CDnnBlob& inputBlob, const CStri
 	float* buffer = outputBlob->GetBuffer<float>( 0, outputBlob->GetDataSize() );
 	repackToChannelFirst( outputBlob->GetDesc(), buffer, result.data() );
 	outputBlob->ReleaseBuffer( buffer, false );
+	dnn.EnableProfile( true );
 
 	std::vector<float> buff( outputBlob->GetDataSize() );
 	{
